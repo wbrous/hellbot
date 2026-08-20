@@ -1,4 +1,4 @@
-"""Logging must work in a GUI/`pythonw` process, where there is no console."""
+"""Logging must work in a GUI process launched without a console."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def test_logging_writes_to_a_rotating_file(tmp_path):
 
 
 def test_logging_survives_a_missing_console(tmp_path, monkeypatch):
-    """pythonw / --noconsole set sys.stderr to None; a StreamHandler would crash."""
+    """A missing console sets sys.stderr to None; a StreamHandler would crash."""
     _reset()
     monkeypatch.setattr(sys, "stderr", None)
     monkeypatch.setattr(sys, "stdout", None)

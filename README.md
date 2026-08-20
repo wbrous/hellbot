@@ -38,7 +38,7 @@ empties and nobody returns within the grace period, the run is dead — permanen
 * **Live log stream** DM'd to the operator: joins, leaves, kicks, milestones, errors
   (`/hell logs tail` shows recent lines in-channel when DMs are off)
 * **All wording in one file** — [`Announcements.py`](Announcements.py) — hot-reloadable
-* A **desktop control panel** (no console) and a one-file **`.exe`** build
+* A **desktop control panel** (no console) and a **systemd unit** + **Docker image** for unattended hosting
 * A large test suite (engine, persistence, Discord edge, GUI, deployment) — ruff + mypy clean
 
 ### What it looks like in Discord
@@ -72,23 +72,19 @@ Live · updates every 20s · /hell status · /hell leaderboard
 
 ## Quick start
 
-### Windows — double-click, no console
+### Linux — control panel
 
-1. Download/clone this folder.
-2. Double-click **`run_bot.bat`** (or `run_bot_silent.vbs` if you don't even want the setup window
-   to flash). First run creates a virtual environment and installs the dependencies automatically.
-3. The **control panel** opens. Fill in the Settings tab → **Save settings** → **Start bot**.
+1. Clone this folder.
+2. Run **`./run_bot.sh`** — the first run creates a virtual environment and installs the
+   dependencies automatically, then the **control panel** opens. Fill in the Settings tab →
+   **Save settings** → **Start bot**. Requires `python3` and `python3-tk`
+   (Debian/Ubuntu: `sudo apt install python3-tk`).
+3. For debugging with visible output there is **`./run_bot_console.sh`**.
 
-Prefer a single file to hand to someone else? Run **`build_exe.bat`** once and you get
-`dist\WelcomeToHellBot.exe` — no Python required on the target machine, no console window, and it
-keeps `.env`, `data\` and `logs\` next to itself.
-
-For debugging with visible output there is **`run_bot_console.bat`**.
-
-### Any OS — console
+### Linux — console
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env      # fill in the token, channel IDs and role IDs
 python bot.py
@@ -107,7 +103,7 @@ A systemd unit is in [`deploy/hellbot.service`](deploy/hellbot.service).
 
 ## The control panel
 
-`launcher_main.py` (what the `.bat` and the `.exe` start) is a small Tk desktop app:
+`launcher_main.py` (what `run_bot.sh` starts) is a small Tk desktop app:
 
 | Tab | What you get |
 |---|---|
@@ -225,8 +221,6 @@ each block lists the `{placeholders}` it accepts.
 * An unknown `{placeholder}` degrades to the raw template and is logged, rather than killing the
   announcement it belongs to.
 * `python tools/simulate.py` prints every message offline, so you can proofread before going live.
-* In a frozen build the file is copied next to `WelcomeToHellBot.exe` and read from there, so
-  wording can be changed without rebuilding.
 
 ## How it works
 
@@ -464,8 +458,7 @@ python tools/simulate.py --fail-at 40 # …of a run that dies after 40 hours
 Tooling lives in `pyproject.toml` (pytest, mypy and ruff are configured there).
 
 **Branding.** `assets/hellbotlogo.png` is the master artwork. After changing it, run
-`python tools/make_icon.py` to regenerate the window icon, the header logo and the
-multi-size Windows `.ico` used by the built executable.
+`python tools/make_icon.py` to regenerate the window icon and the header logo.
 
 `tools/simulate.py` drives the real engine and the real message renderers offline — the fastest way
 to review wording or verify a rule change end to end. A ready-made GitHub Actions workflow (tests on Python

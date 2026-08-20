@@ -11,7 +11,6 @@ Derived files
     assets/hellbot.png     512x512, used by the README and as a general icon
     assets/hellbot-48.png  crisp 48x48 for the launcher header (Tk's own
                            downscaling is nearest-neighbour and looks rough)
-    assets/hellbot.ico     multi-size Windows icon for the window and the .exe
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
 MASTER = ASSETS / "hellbotlogo.png"
-ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 
 def build(source: Path) -> list[Path]:
@@ -52,10 +50,6 @@ def build(source: Path) -> list[Path]:
     small = ASSETS / "hellbot-48.png"
     image.resize((48, 48), Image.LANCZOS).convert("RGB").save(small, optimize=True)
     written.append(small)
-
-    ico = ASSETS / "hellbot.ico"
-    image.resize((256, 256), Image.LANCZOS).save(ico, format="ICO", sizes=ICO_SIZES)
-    written.append(ico)
 
     return written
 

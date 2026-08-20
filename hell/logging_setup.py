@@ -1,6 +1,6 @@
 """Logging setup: rotating file + console, safe when there is no console.
 
-A GUI/`pythonw`/`--noconsole` process has `sys.stderr is None`; attaching a
+A GUI process launched without a terminal has `sys.stderr is None`; attaching a
 StreamHandler to it raises at the first log record.  This module handles that,
 which is exactly what the desktop launcher needs.
 """
@@ -99,7 +99,7 @@ def setup_logging(
                 console.setFormatter(formatter)
             console.setLevel(root.level)
             root.addHandler(console)
-        except Exception:  # pragma: no cover - pythonw edge cases
+        except Exception:  # pragma: no cover - no-console edge cases
             pass
 
     if extra_handler is not None:

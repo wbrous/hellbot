@@ -1,7 +1,7 @@
-"""Entry point for the desktop launcher (and for the built .exe).
+"""Entry point for the desktop launcher.
 
-Shows errors in a message box instead of a console, because when packaged with
-`--noconsole` (or started with `pythonw`) there is nowhere for text to go.
+Shows errors in a message box instead of a console, so a crash is visible even
+when the launcher is started without a terminal (e.g. from a desktop entry).
 """
 
 from __future__ import annotations
@@ -11,19 +11,12 @@ import sys
 import traceback
 from pathlib import Path
 
-# Make `hell` / `launcher` importable when double-clicked from anywhere.
+# Make `hell` / `launcher` importable when run from anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def _popup(title: str, message: str) -> None:
     """Best-effort message box; falls back to stderr when there is no GUI."""
-    try:
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # type: ignore[attr-defined]
-        return
-    except Exception:
-        pass
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -39,7 +32,7 @@ def _popup(title: str, message: str) -> None:
 
 
 def main() -> int:
-    # pythonw / --noconsole give None for stdout+stderr: make them harmless.
+    # Guard against a missing stdio when launched without a terminal.
     if sys.stdout is None:
         sys.stdout = io.StringIO()
     if sys.stderr is None:
@@ -51,9 +44,9 @@ def main() -> int:
         _popup(
             "Welcome to Hell — missing Tkinter",
             "Python was installed without Tkinter, so the control panel cannot open.\n\n"
-            "Windows: reinstall Python from python.org and keep the 'tcl/tk and IDLE' option ticked.\n"
-            "Linux: install the python3-tk package.\n\n"
-            "You can still run the bot in a console with:  python bot.py",
+            "Install the python3-tk package for your distribution "
+            "(Debian/Ubuntu: sudo apt install python3-tk).\n\n"
+            "You can still run the bot in a console with:  ./run_bot_console.sh",
         )
         return 1
 

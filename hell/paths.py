@@ -1,23 +1,16 @@
 """Filesystem locations.
 
-Works both from a source checkout and from a PyInstaller-built `.exe`, where
-everything lives next to the executable instead of next to the sources.
+Every runtime file (`.env`, `data/`, `logs/`) lives next to the project root,
+so the whole checkout is self-contained and can be moved around freely.
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-
-
-def is_frozen() -> bool:
-    return bool(getattr(sys, "frozen", False))
 
 
 def app_base() -> Path:
     """Directory that holds `.env`, `data/` and `logs/`."""
-    if is_frozen():
-        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
 
 

@@ -96,8 +96,6 @@ class Tk(_Widget):
     def destroy(self):
         self.destroyed = True
 
-    def iconbitmap(self, *_a, **_kw):
-        return None
 
     def iconphoto(self, *_a, **_kw):
         return None

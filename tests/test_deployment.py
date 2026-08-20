@@ -1,4 +1,4 @@
-"""Deployment artefacts: the container, the healthcheck and the Windows files.
+"""Deployment artefacts: the container, the healthcheck and the launchers.
 
 The Docker image once shipped without `Announcements.py`, so the container
 crashed on the very first import — nothing in the test suite could see it,
@@ -149,33 +149,20 @@ def test_healthcheck_runs_as_a_script(tmp_path):
     assert "UNHEALTHY" in result.stdout
 
 
-# ------------------------------------------------------------- the Windows files
+# ------------------------------------------------------------- the launchers
 
 
-def test_windows_launchers_reference_the_right_entry_points():
-    bat = (ROOT / "run_bot.bat").read_text(encoding="utf-8", errors="replace")
-    assert "launcher_main.py" in bat
-    assert "pythonw.exe" in bat                          # no console window
-    assert "requirements.txt" in bat                     # first-run install
+def test_linux_launchers_reference_the_right_entry_points():
+    gui = (ROOT / "run_bot.sh").read_text(encoding="utf-8")
+    assert "launcher_main.py" in gui
+    assert "requirements.txt" in gui                     # first-run install
+    assert "python3 -m venv" in gui                      # first-run setup
 
-    console = (ROOT / "run_bot_console.bat").read_text(encoding="utf-8", errors="replace")
+    console = (ROOT / "run_bot_console.sh").read_text(encoding="utf-8")
     assert "bot.py" in console
 
-    vbs = (ROOT / "run_bot_silent.vbs").read_text(encoding="utf-8", errors="replace")
-    assert "run_bot.bat" in vbs
-
-    build = (ROOT / "build_exe.bat").read_text(encoding="utf-8", errors="replace")
-    assert "hellbot.spec" in build
-    assert "Announcements.py" in build                   # editable next to the exe
-
-
-def test_pyinstaller_spec_bundles_the_message_file_and_entry_point():
-    spec = (ROOT / "hellbot.spec").read_text(encoding="utf-8")
-    assert "launcher_main.py" in spec
-    assert "Announcements" in spec
-    assert "console=False" in spec                       # GUI build, no console
-    for module in ("hell.texts", "hell.logsink", "hell.dm", "hell.grace"):
-        assert module in spec, f"{module} missing from hiddenimports"
+    for script in (ROOT / "run_bot.sh", ROOT / "run_bot_console.sh"):
+        assert script.stat().st_mode & 0o111, f"{script.name} is not executable"
 
 
 def test_the_build_context_excludes_secrets_and_state():
@@ -188,20 +175,14 @@ def test_the_build_context_excludes_secrets_and_state():
 # ------------------------------------------------------------------- branding
 
 def test_the_logo_assets_are_present_and_usable():
-    """The launcher window, the taskbar and the built .exe all need these."""
+    """The launcher window and the README both use these."""
     master = ROOT / "assets" / "hellbotlogo.png"
     png = ROOT / "assets" / "hellbot.png"
     header_png = ROOT / "assets" / "hellbot-48.png"
-    ico = ROOT / "assets" / "hellbot.ico"
 
     assert master.is_file(), "the master artwork is missing"
     for image in (master, png, header_png):
         assert image.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", f"{image.name} is not a PNG"
-    assert ico.read_bytes()[:4] == b"\x00\x00\x01\x00", "hellbot.ico is not an ICO"
-
-    # Windows shows the icon at many sizes; a single-resolution .ico looks bad.
-    icon_count = int.from_bytes(ico.read_bytes()[4:6], "little")
-    assert icon_count >= 4, f"hellbot.ico only contains {icon_count} size(s)"
 
     # The header image must be small: Tk downscaling looks ragged.
     assert header_png.stat().st_size < 20_000
@@ -219,12 +200,9 @@ def test_the_icons_can_be_rebuilt_from_the_master(tmp_path):
     assert [path.name for path in module.build(module.MASTER)] == [
         "hellbot.png",
         "hellbot-48.png",
-        "hellbot.ico",
     ]
 
 
-def test_the_spec_and_readme_use_the_logo():
-    spec = (ROOT / "hellbot.spec").read_text(encoding="utf-8")
-    assert "hellbot.ico" in spec
+def test_the_readme_uses_the_logo():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "assets/hellbot.png" in readme

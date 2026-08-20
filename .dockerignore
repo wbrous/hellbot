@@ -24,8 +24,5 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
-*.bat
-*.vbs
-*.spec
 launcher/
 launcher_main.py

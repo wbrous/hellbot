@@ -2,7 +2,7 @@
 
     python bot.py                 # console
     python -m hell.bot            # same
-    launcher (GUI)                # see launcher/ and run_bot.bat
+    launcher (GUI)                # see launcher/ and run_bot.sh
 
 Wiring:
     Store (persistence) -> HellEngine (state / tracking / milestones)
@@ -176,7 +176,7 @@ async def run(config: Optional[Config] = None) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
-        except (NotImplementedError, RuntimeError, AttributeError):  # Windows / non-main thread
+        except (RuntimeError, AttributeError):  # non-main thread (GUI launcher)
             pass
 
     async with bot:

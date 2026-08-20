@@ -7,8 +7,6 @@ Why a loader instead of a plain import?
 * **Crash safety** — if the edited file has a syntax error or a missing name,
   the previously loaded text stays in use and the problem is reported instead
   of taking the bot (and a 160-hour run) down.
-* **Editable next to the .exe** — a frozen build looks for `Announcements.py`
-  beside the executable first, so messages can be changed without rebuilding.
 
 Call sites use the module-level ``TEXT`` proxy, which always resolves to the
 currently loaded module::
@@ -58,7 +56,7 @@ def _load_from_file(path: Path) -> ModuleType:
 def _candidates() -> list[Path]:
     """Where to look, most-editable first."""
     here = Path(__file__).resolve().parent
-    return [app_base() / FILE_NAME, here.parent / FILE_NAME, here / FILE_NAME]
+    return [app_base() / FILE_NAME, here / FILE_NAME]
 
 
 def load(force: bool = False) -> ModuleType:

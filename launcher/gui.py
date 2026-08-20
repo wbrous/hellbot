@@ -11,9 +11,7 @@ window never freezes and closing it shuts the bot down cleanly.
 
 from __future__ import annotations
 
-import os
 import subprocess
-import sys
 import tkinter as tk
 import traceback
 import webbrowser
@@ -41,8 +39,8 @@ OK = "#3fb950"
 WARN = "#d29922"
 BAD = "#f85149"
 
-FONT = "Segoe UI"
-MONO = "Consolas"
+FONT = "DejaVu Sans"
+MONO = "DejaVu Sans Mono"
 
 STATUS_COLORS = {
     STOPPED: MUTED,
@@ -99,13 +97,10 @@ class LauncherApp(tk.Tk):
         return None
 
     def _set_icon(self) -> None:
-        """Window/taskbar icon; silently ignored if the assets are missing."""
+        """Window icon; silently ignored if the assets are missing."""
         base = Path(__file__).resolve().parent.parent
-        ico, png = base / "assets" / "hellbot.ico", base / "assets" / "hellbot.png"
+        png = base / "assets" / "hellbot.png"
         try:
-            if sys.platform.startswith("win") and ico.exists():
-                self.iconbitmap(default=str(ico))
-                return
             if png.exists():
                 self._icon_image = tk.PhotoImage(file=str(png))
                 self.iconphoto(True, self._icon_image)
@@ -419,12 +414,7 @@ class LauncherApp(tk.Tk):
     def on_open_logs(self) -> None:
         folder = Path(self.supervisor.log_file_path()).parent
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(folder))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(folder)])
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
+            subprocess.Popen(["xdg-open", str(folder)])
         except Exception as exc:
             messagebox.showinfo("Log folder", f"{folder}\n\n({exc})", parent=self)
 

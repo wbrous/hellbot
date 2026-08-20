@@ -310,4 +310,3 @@ def test_paths_point_inside_the_project():
     assert paths.log_file().name == "hellbot.log"
     assert paths.resolve("data/x.sqlite3") == base / "data" / "x.sqlite3"
     assert paths.resolve("/tmp/absolute.sqlite3").is_absolute()
-    assert paths.is_frozen() is False
