@@ -21,6 +21,24 @@ except Exception:  # pragma: no cover - dotenv is in requirements but stay safe
 DEFAULT_VOICE_CHANNEL_ID = 1539756705997652079
 DEFAULT_LOG_DM_USER_ID = 984083829767675965  # Jaime Gaming — live log recipient
 
+# Bots that must always be kicked from the VC (comma-separated in KICK_BOT_IDS).
+_DEFAULT_KICK_BOT_IDS = frozenset({412347780841865216, 513423712582762502})
+
+
+def _parse_kick_bot_ids(raw: str) -> frozenset[int]:
+    """Parse comma-separated bot IDs; defaults to the hardcoded set."""
+    if not raw.strip():
+        return _DEFAULT_KICK_BOT_IDS
+    ids: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.add(int(part))
+            except ValueError as exc:
+                raise ConfigError(f"KICK_BOT_IDS contains non-numeric value: {part!r}") from exc
+    return frozenset(ids) if ids else _DEFAULT_KICK_BOT_IDS
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing something the bot cannot run without."""
@@ -48,11 +66,27 @@ def _float_env(name: str, default: float) -> float:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
 
 
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "off"}
+
+
 def _bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean setting, failing loudly on typos.
+
+    A silent misread here is dangerous: `ALIVE_CHECK_ENABLED=flase` would
+    quietly turn the roll calls off, and `LOG_DM_ENABLED=ture` would quietly
+    silence the log stream.  An unrecognised value raises instead.
+    """
     raw = os.getenv(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "y", "on"}
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    raise ConfigError(
+        f"{name} must be true/false, yes/no, on/off or 1/0 — got {raw!r}"
+    )
 
 
 @dataclass
@@ -66,6 +100,9 @@ class Config:
 
     gamenight_host_role_id: int
     clanker_role_id: int
+
+    # Bots that are always kicked from the VC (never allowed to stay).
+    kick_bot_ids: frozenset[int] = field(default_factory=lambda: _DEFAULT_KICK_BOT_IDS)
 
     # Reward roles are announcement-only (the bot never assigns them), but the
     # IDs let the announcements render real mentions instead of plain text.
@@ -82,7 +119,6 @@ class Config:
     empty_vc_grace_seconds: float = 15.0  # empty VC -> this long to repopulate or the run dies
     max_tick_credit: float = 5.0         # cap per-tick leaderboard credit (downtime guard)
     downtime_credit_seconds: float = 300.0  # short outages are credited back (see engine.tick)
-    require_occupants_to_start: bool = True
     heartbeat_minutes: float = 15.0
 
     # --- alive checks ("roll call") ---
@@ -102,7 +138,13 @@ class Config:
     log_dm_user_id: int = DEFAULT_LOG_DM_USER_ID
     log_dm_level: str = "INFO"
     log_dm_flush_seconds: float = 3.0
+    log_dm_ping_level: str = "ERROR"          # severity that triggers an @-ping DM
+    log_dm_ping_cooldown_seconds: float = 300.0  # min gap between alert pings
     log_level: str = "INFO"
+
+    # --- live web dashboard ---
+    web_port: int = 8080
+    github_pages_sync: bool = False
 
     @classmethod
     def from_env(cls, env_file: str | os.PathLike[str] | None = None) -> Config:
@@ -122,6 +164,7 @@ class Config:
             announce_channel_id=_int_env("ANNOUNCE_CHANNEL_ID", required=True),  # type: ignore[arg-type]
             gamenight_host_role_id=_int_env("GAMENIGHT_HOST_ROLE_ID", required=True),  # type: ignore[arg-type]
             clanker_role_id=_int_env("CLANKER_ROLE_ID", required=True),  # type: ignore[arg-type]
+            kick_bot_ids=_parse_kick_bot_ids(os.getenv("KICK_BOT_IDS", "")),
             hell_role_id=_int_env("HELL_ROLE_ID"),
             hellist_role_id=_int_env("HELLIST_ROLE_ID"),
             hell_master_role_id=_int_env("HELL_MASTER_ROLE_ID"),
@@ -133,7 +176,6 @@ class Config:
             empty_vc_grace_seconds=_float_env("EMPTY_VC_GRACE_SECONDS", 15.0),
             max_tick_credit=_float_env("MAX_TICK_CREDIT_SECONDS", 5.0),
             downtime_credit_seconds=_float_env("DOWNTIME_CREDIT_SECONDS", 300.0),
-            require_occupants_to_start=_bool_env("REQUIRE_OCCUPANTS_TO_START", True),
             heartbeat_minutes=_float_env("HEARTBEAT_MINUTES", 15.0),
             alive_check_enabled=_bool_env("ALIVE_CHECK_ENABLED", True),
             alive_check_min_hours=_float_env("ALIVE_CHECK_MIN_HOURS", 1.0),
@@ -147,7 +189,11 @@ class Config:
             log_dm_user_id=_int_env("LOG_DM_USER_ID", default=DEFAULT_LOG_DM_USER_ID),  # type: ignore[arg-type]
             log_dm_level=os.getenv("LOG_DM_LEVEL", "INFO").strip().upper() or "INFO",
             log_dm_flush_seconds=_float_env("LOG_DM_FLUSH_SECONDS", 3.0),
+            log_dm_ping_level=os.getenv("LOG_DM_PING_LEVEL", "ERROR").strip().upper() or "ERROR",
+            log_dm_ping_cooldown_seconds=_float_env("LOG_DM_PING_COOLDOWN_SECONDS", 300.0),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            web_port=int(os.getenv("WEB_PORT", "8080") or 8080),
+            github_pages_sync=_bool_env("GITHUB_PAGES_SYNC", False),
         )
 
     def summary(self) -> list[tuple[str, str]]:
@@ -158,6 +204,7 @@ class Config:
             ("Announcements", str(self.announce_channel_id)),
             ("Host role", str(self.gamenight_host_role_id)),
             ("Clanker role", str(self.clanker_role_id)),
+            ("Kick bot IDs", ", ".join(str(i) for i in sorted(self.kick_bot_ids)) if self.kick_bot_ids else "none"),
             ("Database", str(self.database_path)),
             ("Monitor / progress", f"{self.monitor_interval:g}s / {self.progress_interval:g}s"),
             ("Empty-VC grace", f"{self.empty_vc_grace_seconds:g}s"),
@@ -174,7 +221,12 @@ class Config:
             ("Final DMs", "on" if self.send_final_dms else "off"),
             (
                 "Live log stream",
-                f"{self.log_dm_level} -> {self.log_dm_user_id}" if self.log_dm_enabled else "off",
+                (
+                    f"{self.log_dm_level} -> {self.log_dm_user_id} · "
+                    f"ping ≥ {self.log_dm_ping_level} (cooldown {self.log_dm_ping_cooldown_seconds:g}s)"
+                    if self.log_dm_enabled
+                    else "off"
+                ),
             ),
         ]
 

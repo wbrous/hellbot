@@ -17,7 +17,7 @@ from collections.abc import Iterable, Sequence
 
 from .models import LeaderboardEntry, ParticipantRef
 from .texts import TEXT, say
-from .timeutil import format_hm
+from .timeutil import format_hm, format_hms
 
 
 def build_leaderboard(rows: Iterable[tuple[int, str, float]]) -> list[LeaderboardEntry]:
@@ -54,13 +54,30 @@ def top_participants(entries: Sequence[LeaderboardEntry], n: int = 3) -> list[Pa
 
 def medals() -> dict[int, str]:
     """Podium markers, editable in Announcements.py."""
-    return {int(k): v for k, v in dict(TEXT.LEADERBOARD_MEDALS).items()}
+    try:
+        return {int(k): v for k, v in dict(TEXT.LEADERBOARD_MEDALS).items()}
+    except (TypeError, ValueError):  # pragma: no cover - human-editable text file
+        return {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
 def format_entry(entry: LeaderboardEntry, use_mentions: bool = True) -> str:
     who = entry.mention() if use_mentions else entry.display_name
     prefix = medals().get(entry.rank, say(TEXT.LEADERBOARD_RANK, rank=entry.rank))
     return say(TEXT.LEADERBOARD_ENTRY, medal=prefix, who=who, time=format_hm(entry.seconds))
+
+
+def format_entry_live(entry: LeaderboardEntry, *, top_n: int = 5) -> str:
+    """Format a leaderboard entry for the live auto-updating leaderboard.
+
+    Top *top_n* entries show time with seconds; everyone else shows only
+    their position and name (no time).
+    """
+    who = entry.mention()
+    if entry.rank <= top_n:
+        prefix = medals().get(entry.rank, say(TEXT.LEADERBOARD_RANK, rank=entry.rank))
+        return say(TEXT.LEADERBOARD_ENTRY, medal=prefix, who=who, time=format_hms(entry.seconds))
+    prefix = say(TEXT.LEADERBOARD_RANK, rank=entry.rank)
+    return f"{prefix}  {who}"
 
 
 def render_leaderboard(
