@@ -25,7 +25,7 @@ from .models import EventState, EventStatus, LeaderboardEntry, MilestoneRecord, 
 
 log = logging.getLogger("hell.storage")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -52,10 +52,14 @@ CREATE TABLE IF NOT EXISTS event (
     end_reason           TEXT,
     final_saved          INTEGER NOT NULL DEFAULT 0,
     grace_started_ts     REAL,             -- empty-VC grace window in progress
+    grace_duration       REAL,             -- duration of the active grace window
     last_valid_observed_ts REAL,           -- last tick with at least one valid human [crash-recovery]
     paused_ts            REAL,             -- event paused: global + per-user timers frozen
     paused_seconds       REAL NOT NULL DEFAULT 0,  -- total paused time, never counted
-    pause_reason         TEXT              -- why it was paused (audit trail)
+    pause_reason         TEXT,             -- why it was paused (audit trail)
+    total_seconds        REAL NOT NULL DEFAULT 576000.0,  -- 160h normally, 320h after continuation
+    milestones_enabled   INTEGER NOT NULL DEFAULT 1,     -- phase 2 continuation has no milestones
+    continuation         INTEGER NOT NULL DEFAULT 0      -- Hell 2 (320h) continuation run
 );
 
 CREATE TABLE IF NOT EXISTS user_time (
@@ -128,6 +132,38 @@ CREATE TABLE IF NOT EXISTS final_leaderboard (
     PRIMARY KEY (event_uid, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_final_order ON final_leaderboard(event_uid, position);
+
+CREATE TABLE IF NOT EXISTS hell_events (
+    id             TEXT PRIMARY KEY,
+    event_uid      TEXT NOT NULL,
+    event_type     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    start_ts       REAL NOT NULL,
+    end_ts         REAL NOT NULL,
+    state          TEXT NOT NULL,
+    affected_users TEXT NOT NULL DEFAULT '[]',
+    metadata       TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_hell_events_uid ON hell_events(event_uid);
+
+CREATE TABLE IF NOT EXISTS continuation_poll (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    event_uid   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'none',   -- none | open | closed | resumed
+    channel_id  INTEGER,
+    message_id  INTEGER,
+    started_ts  REAL,
+    deadline_ts REAL,
+    result      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS continuation_votes (
+    event_uid TEXT NOT NULL,
+    user_id   INTEGER NOT NULL,
+    answer    TEXT NOT NULL,               -- yes | no
+    voted_ts  REAL NOT NULL,
+    PRIMARY KEY (event_uid, user_id)
+);
 """
 
 
@@ -163,10 +199,14 @@ class Store:
         columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(event)").fetchall()}
         for name, ddl in (
             ("grace_started_ts", "REAL"),
+            ("grace_duration", "REAL"),
             ("last_valid_observed_ts", "REAL"),
             ("paused_ts", "REAL"),
             ("paused_seconds", "REAL NOT NULL DEFAULT 0"),
             ("pause_reason", "TEXT"),
+            ("total_seconds", "REAL NOT NULL DEFAULT 576000.0"),
+            ("milestones_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("continuation", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 log.info("Migrating database: adding event.%s", name)
@@ -209,6 +249,24 @@ class Store:
     def get_unverified_seconds(self, event_uid: str) -> float:
         return float(self.get_meta(f"unverified:{event_uid}", "0") or 0)
 
+    def set_alive_check_emptied(self, event_uid: str, ts: float) -> None:
+        """Remember that an alive check just emptied the VC."""
+        self.set_meta(f"alive_check_emptied:{event_uid}", repr(float(ts)))
+
+    def get_alive_check_emptied(self, event_uid: str) -> Optional[float]:
+        """Check if an alive check recently emptied the VC."""
+        raw = self.get_meta(f"alive_check_emptied:{event_uid}")
+        try:
+            return float(raw) if raw is not None else None
+        except ValueError:
+            return None
+
+    def clear_alive_check_emptied(self, event_uid: str) -> None:
+        """Clear the alive check emptied flag."""
+        key = f"alive_check_emptied:{event_uid}"
+        with self._lock:
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
     # ----------------------------------------------------------- event state
 
     def load_state(self) -> EventState:
@@ -228,10 +286,14 @@ class Store:
             end_reason=r["end_reason"],
             final_saved=bool(r["final_saved"]),
             grace_started_ts=r["grace_started_ts"],
+            grace_duration=r["grace_duration"] if "grace_duration" in r.keys() else None,
             last_valid_observed_ts=r["last_valid_observed_ts"],
             paused_ts=r["paused_ts"],
             paused_seconds=float(r["paused_seconds"] or 0),
             pause_reason=r["pause_reason"],
+            total_seconds=float(r["total_seconds"] or 576000.0),
+            milestones_enabled=bool(r["milestones_enabled"]),
+            continuation=bool(r["continuation"]),
         )
 
     def save_state(self, state: EventState) -> None:
@@ -243,8 +305,9 @@ class Store:
                     guild_id = ?, voice_channel_id = ?, announce_channel_id = ?,
                     progress_channel_id = ?, progress_message_id = ?, started_by = ?,
                     end_reason = ?, final_saved = ?, grace_started_ts = ?,
-                    last_valid_observed_ts = ?, paused_ts = ?, paused_seconds = ?,
-                    pause_reason = ?
+                    grace_duration = ?, last_valid_observed_ts = ?, paused_ts = ?,
+                    paused_seconds = ?, pause_reason = ?, total_seconds = ?,
+                    milestones_enabled = ?, continuation = ?
                 WHERE id = 1
                 """,
                 (
@@ -262,10 +325,14 @@ class Store:
                     state.end_reason,
                     int(state.final_saved),
                     state.grace_started_ts,
+                    state.grace_duration,
                     state.last_valid_observed_ts,
                     state.paused_ts,
                     state.paused_seconds,
                     state.pause_reason,
+                    state.total_seconds,
+                    int(state.milestones_enabled),
+                    int(state.continuation),
                 ),
             )
 
@@ -286,10 +353,13 @@ class Store:
                 "UPDATE event SET last_valid_observed_ts = ? WHERE id = 1", (ts,)
             )
 
-    def set_grace_started(self, ts: Optional[float]) -> None:
+    def set_grace_started(self, ts: Optional[float], duration: Optional[float] = None) -> None:
         """Persist the empty-VC grace window so a restart resumes it."""
         with self._lock:
-            self._conn.execute("UPDATE event SET grace_started_ts = ? WHERE id = 1", (ts,))
+            self._conn.execute(
+                "UPDATE event SET grace_started_ts = ?, grace_duration = ? WHERE id = 1",
+                (ts, duration if ts is not None else None),
+            )
 
     def set_progress_message(self, channel_id: Optional[int], message_id: Optional[int]) -> None:
         with self._lock:
@@ -598,6 +668,268 @@ class Store:
             ).fetchall()
         return [LeaderboardEntry(r["rank"], r["user_id"], r["display_name"], r["seconds"]) for r in rows]
 
+    # ----------------------------------------------------------- peak population
+
+    def record_population(self, event_uid: str, count: int) -> int:
+        """Update and return the peak human VC population observed."""
+        key = f"peak_population:{event_uid}"
+        current = self.get_peak_population(event_uid)
+        if count > current:
+            self.set_meta(key, str(count))
+            return count
+        return current
+
+    def get_peak_population(self, event_uid: str) -> int:
+        raw = self.get_meta(f"peak_population:{event_uid}")
+        try:
+            return int(raw) if raw is not None else 0
+        except ValueError:
+            return 0
+
+    # ----------------------------------------------------------- finale stages
+
+    def get_finale_stages(self, event_uid: str) -> set[str]:
+        raw = self.get_meta(f"finale_stages:{event_uid}")
+        if not raw:
+            return set()
+        try:
+            return set(json.loads(raw))
+        except json.JSONDecodeError:
+            return set()
+
+    def mark_finale_stage(self, event_uid: str, stage: str) -> None:
+        stages = self.get_finale_stages(event_uid)
+        stages.add(stage)
+        self.set_meta(f"finale_stages:{event_uid}", json.dumps(sorted(stages)))
+
+    # -------------------------------------------------------- continuation vote
+
+    def get_continuation_poll(self) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM continuation_poll WHERE id = 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_continuation_poll(
+        self,
+        event_uid: str,
+        *,
+        channel_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        started_ts: Optional[float] = None,
+        deadline_ts: Optional[float] = None,
+        status: str = "open",
+        result: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO continuation_poll(id, event_uid, status, channel_id, message_id,
+                                              started_ts, deadline_ts, result)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    event_uid = excluded.event_uid,
+                    status = excluded.status,
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    started_ts = excluded.started_ts,
+                    deadline_ts = excluded.deadline_ts,
+                    result = excluded.result
+                """,
+                (
+                    event_uid,
+                    status,
+                    channel_id,
+                    message_id,
+                    started_ts,
+                    deadline_ts,
+                    result,
+                ),
+            )
+
+    def clear_continuation_poll(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM continuation_poll WHERE id = 1")
+
+    def record_continuation_vote(self, event_uid: str, user_id: int, answer: str, ts: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO continuation_votes(event_uid, user_id, answer, voted_ts)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(event_uid, user_id) DO UPDATE SET
+                    answer = excluded.answer,
+                    voted_ts = excluded.voted_ts
+                """,
+                (event_uid, user_id, answer, ts),
+            )
+
+    def continuation_votes(self, event_uid: str) -> dict[int, str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT user_id, answer FROM continuation_votes WHERE event_uid = ?",
+                (event_uid,),
+            ).fetchall()
+        return {r["user_id"]: r["answer"] for r in rows}
+
+    def continuation_vote_counts(self, event_uid: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT answer, COUNT(*) AS n FROM continuation_votes WHERE event_uid = ? GROUP BY answer",
+                (event_uid,),
+            ).fetchall()
+        counts = {"yes": 0, "no": 0}
+        for row in rows:
+            counts[row["answer"]] = row["n"]
+        return counts
+
+    # ------------------------------------------------------------ hell events
+
+    def save_hell_event(
+        self,
+        event_uid: str,
+        *,
+        event_id: str,
+        event_type: str,
+        name: str,
+        start_ts: float,
+        end_ts: float,
+        state: str,
+        affected_users: Sequence[int] = (),
+        metadata: Optional[dict] = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO hell_events(
+                    id, event_uid, event_type, name, start_ts, end_ts, state, affected_users, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    event_uid,
+                    event_type,
+                    name,
+                    start_ts,
+                    end_ts,
+                    state,
+                    json.dumps(list(affected_users)),
+                    json.dumps(metadata or {}),
+                ),
+            )
+
+    def update_hell_event(
+        self,
+        event_id: str,
+        *,
+        state: Optional[str] = None,
+        end_ts: Optional[float] = None,
+        affected_users: Optional[Sequence[int]] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM hell_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if not row:
+                return
+            new_state = state if state is not None else row["state"]
+            new_end = end_ts if end_ts is not None else row["end_ts"]
+            new_users = (
+                json.dumps(list(affected_users))
+                if affected_users is not None
+                else row["affected_users"]
+            )
+            new_meta = (
+                json.dumps(metadata)
+                if metadata is not None
+                else row["metadata"]
+            )
+            self._conn.execute(
+                """
+                UPDATE hell_events SET
+                    state = ?, end_ts = ?, affected_users = ?, metadata = ?
+                WHERE id = ?
+                """,
+                (new_state, new_end, new_users, new_meta, event_id),
+            )
+
+    def get_active_hell_event(self, event_uid: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM hell_events WHERE event_uid = ? AND state = 'active' ORDER BY start_ts DESC LIMIT 1",
+                (event_uid,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "event_uid": row["event_uid"],
+            "event_type": row["event_type"],
+            "name": row["name"],
+            "start_ts": row["start_ts"],
+            "end_ts": row["end_ts"],
+            "state": row["state"],
+            "affected_users": json.loads(row["affected_users"]),
+            "metadata": json.loads(row["metadata"]),
+        }
+
+    def get_hell_event(self, event_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM hell_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "event_uid": row["event_uid"],
+            "event_type": row["event_type"],
+            "name": row["name"],
+            "start_ts": row["start_ts"],
+            "end_ts": row["end_ts"],
+            "state": row["state"],
+            "affected_users": json.loads(row["affected_users"]),
+            "metadata": json.loads(row["metadata"]),
+        }
+
+    def get_hell_events_history(self, event_uid: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM hell_events WHERE event_uid = ? ORDER BY start_ts DESC",
+                (event_uid,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "event_uid": r["event_uid"],
+                "event_type": r["event_type"],
+                "name": r["name"],
+                "start_ts": r["start_ts"],
+                "end_ts": r["end_ts"],
+                "state": r["state"],
+                "affected_users": json.loads(r["affected_users"]),
+                "metadata": json.loads(r["metadata"]),
+            }
+            for r in rows
+        ]
+
+    def set_next_hell_event(self, event_uid: str, ts: Optional[float]) -> None:
+        key = f"next_hell_event:{event_uid}"
+        if ts is None:
+            with self._lock:
+                self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+            return
+        self.set_meta(key, repr(float(ts)))
+
+    def get_next_hell_event(self, event_uid: str) -> Optional[float]:
+        raw = self.get_meta(f"next_hell_event:{event_uid}")
+        try:
+            return float(raw) if raw is not None else None
+        except ValueError:
+            return None
+
     # ------------------------------------------------------------ maintenance
 
     def reset_all(self) -> None:
@@ -607,17 +939,22 @@ class Store:
                 for table in (
                     "user_time", "milestones", "milestone_members", "presence",
                     "final_leaderboard", "alive_check", "alive_check_history", "dm_log",
+                    "hell_events", "continuation_votes",
                 ):
                     self._conn.execute(f"DELETE FROM {table}")
+                self._conn.execute("DELETE FROM continuation_poll WHERE id = 1")
                 self._conn.execute(
-                    "DELETE FROM meta WHERE key LIKE 'next_alive_check:%' OR key LIKE 'unverified:%'"
+                    "DELETE FROM meta WHERE key LIKE 'next_alive_check:%' OR key LIKE 'unverified:%' "
+                    "OR key LIKE 'alive_check_emptied:%' OR key LIKE 'next_hell_event:%' "
+                    "OR key LIKE 'peak_population:%' OR key LIKE 'finale_stages:%'"
                 )
                 self._conn.execute(
                     "UPDATE event SET status = ?, event_uid = NULL, start_ts = NULL, end_ts = NULL, "
                     "last_tick_ts = NULL, progress_channel_id = NULL, progress_message_id = NULL, "
                     "started_by = NULL, end_reason = NULL, final_saved = 0, "
-                    "grace_started_ts = NULL, last_valid_observed_ts = NULL, "
-                    "paused_ts = NULL, paused_seconds = 0, pause_reason = NULL WHERE id = 1",
+                    "grace_started_ts = NULL, grace_duration = NULL, last_valid_observed_ts = NULL, "
+                    "paused_ts = NULL, paused_seconds = 0, pause_reason = NULL, "
+                    "total_seconds = 576000.0, milestones_enabled = 1, continuation = 0 WHERE id = 1",
                     (EventStatus.IDLE.value,),
                 )
                 self._conn.execute("COMMIT")

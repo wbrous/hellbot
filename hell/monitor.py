@@ -28,7 +28,9 @@ from .alivecheck import AliveCheckManager
 from .aliveio import DiscordAliveCheckIO
 from .announcer import Announcer
 from .config import Config
+from .continuation import ContinuationManager
 from .dm import FinalReportDM
+from .embeds import theme_color
 from .engine import (
     EventCancelled,
     EventCompleted,
@@ -40,9 +42,9 @@ from .engine import (
     Observation,
 )
 from .models import EventStatus, ParticipantRef
+from .pages_sync import push_docs
 from .security import SuspicionTracker
 from .status_writer import get_status as get_status_writer
-from .pages_sync import push_docs
 from .tasks import spawn
 from .timeutil import format_hm, now_ts
 
@@ -62,9 +64,14 @@ class VoiceMonitor:
         self.engine = engine
         self.announcer = announcer
         self.alive_io = DiscordAliveCheckIO(bot, config)
-        self.alive_checks = AliveCheckManager(config, engine.store, self.alive_io)
+        self.alive_checks = AliveCheckManager(config, engine.store, self.alive_io, engine=engine)
         self.alive_checks.bind(engine.event_uid)
+        self.engine.hell_events.announcer = announcer
+        self.engine.hell_events.alive_checks = self.alive_checks
+        self.engine.finale.announcer = announcer
         self.reports = FinalReportDM(bot, config, engine, announcer)
+        self.continuation = ContinuationManager(bot, config, engine, announcer)
+        self.reports.continuation = self.continuation
         self.security = SuspicionTracker(self.alive_checks)
         self._ready_at: Optional[float] = None
         self._kick_attempts: dict[int, float] = {}
@@ -257,11 +264,21 @@ class VoiceMonitor:
         for event in events:
             await self.dispatch(event)
 
-        # While paused the event is frozen: no roll calls may start or resolve
-        # (nobody should be kicked for failing to answer during a freeze).
+        # While paused the event is frozen: no roll calls or hell events advance
         if self.engine.is_running and not self.engine.is_paused:
             self._ensure_alive_checks_bound(now)
             self._pump_alive_check(now, humans)
+            # Hell Events & Finale tick.  Hell 2 continuation has one finish
+            # (the secret 320h reward), so the 159-160h finale never repeats.
+            await self.engine.hell_events.tick(now, humans)
+            if not self.engine.is_continuation:
+                await self.engine.finale.tick(now, self.engine.elapsed(now), humans)
+
+            # In the final 60 seconds (countdown mode), update progress display every second
+            if self.engine.finale.is_countdown(self.engine.elapsed(now)):
+                await self.announcer.update_progress(
+                    self.engine.snapshot(now=now, participants=len(humans)), force=True
+                )
         self._heartbeat(len(humans))
         # Security/anomaly checks (run on every tick, cheap).
         self.security.check_stale()
@@ -292,11 +309,32 @@ class VoiceMonitor:
 
         async def runner() -> None:
             try:
-                await self.alive_checks.tick(now, list(humans))
+                res = await self.alive_checks.tick(now, list(humans))
+                if res is not None and res.emptied_vc:
+                    self.engine.notify_alive_check_emptied(now)
             except Exception:  # pragma: no cover - never break the event loop
                 log.exception("Alive check tick failed")
 
         self._alive_task = spawn(runner(), name="alive-check")
+
+    def sync_status(self) -> None:
+        """Write docs/status.json and trigger GitHub Pages sync if enabled."""
+        try:
+            get_status_writer().write(
+                "docs/status.json",
+                engine=self.engine,
+                monitor=self,
+                stream=getattr(self.bot, "log_stream", None),
+                bot=self.bot,
+            )
+        except Exception:
+            log.debug("Could not write status.json", exc_info=True)
+
+        if getattr(self.config, "github_pages_sync", False):
+            try:
+                spawn(push_docs(), name="pages-sync")
+            except RuntimeError:
+                pass  # no running event loop (e.g. in tests)
 
     def _heartbeat(self, participants: int) -> None:
         """Periodic proof-of-life in the log file, useful when running headless."""
@@ -316,17 +354,8 @@ class VoiceMonitor:
             participants,
             f"{snap.upcoming.hours}h" if snap.upcoming else "none",
         )
-        # Write the GitHub Pages status JSON on every heartbeat.
-        try:
-            get_status_writer().write("docs/status.json", engine=self.engine, monitor=self, stream=getattr(self.bot, "log_stream", None))
-        except Exception:
-            log.debug("Could not write status.json", exc_info=True)
-        # Push docs/ to GitHub so Pages stays current (only when explicitly enabled).
-        if getattr(self.config, "github_pages_sync", False):
-            try:
-                spawn(push_docs(), name="pages-sync")
-            except RuntimeError:
-                pass  # no running event loop (e.g. in tests)
+        # Write the GitHub Pages status JSON and trigger Pages sync.
+        self.sync_status()
 
     @tasks.loop(seconds=20.0)
     async def _progress_loop(self) -> None:
@@ -369,18 +398,22 @@ class VoiceMonitor:
             await self._final_progress(terminal=False)
         elif isinstance(event, MilestoneReached):
             await self.announcer.announce_milestone(event)
+            self.sync_status()
         elif isinstance(event, EventFailed):
             await self.announcer.announce_failure(event)
             await self._final_progress()
             self.reports.schedule()          # DM every contestant their stats
+            self.sync_status()
         elif isinstance(event, EventCompleted):
             await self.announcer.announce_completion(event)
             await self._final_progress()
             self.reports.schedule()
+            self.sync_status()
         elif isinstance(event, EventCancelled):
             await self.announcer.announce_cancelled(event)
             await self._final_progress()
             self.reports.schedule()
+            self.sync_status()
 
     async def _final_progress(self, *, terminal: bool = True) -> None:
         self._terminal_rendered = terminal
@@ -397,9 +430,17 @@ class VoiceMonitor:
         pending = self.alive_checks.pending
         if pending is None:
             return
-        if self.alive_checks.register_reply(message.author.id, message.content, message.channel.id):
+        handled = await self.alive_checks.process_reply(
+            message.author.id, message.content, message.channel.id
+        )
+        if handled == "yes":
             try:
                 await message.add_reaction("✅")
+            except discord.HTTPException:
+                pass
+        elif handled == "no":
+            try:
+                await message.add_reaction("👋")
             except discord.HTTPException:
                 pass
 
@@ -428,6 +469,10 @@ class VoiceMonitor:
             if self.reports.pending():
                 log.info("Resuming end-of-event stat cards after restart")
                 self.reports.schedule()
+            elif self.config.send_final_dms:
+                # The 160h run is over and the cards are out — make sure the
+                # "keep on Hell?" question is still live after a restart.
+                await self.continuation.ensure_for(state.event_uid)
             return
         if state.status is not EventStatus.RUNNING:
             return
@@ -454,6 +499,8 @@ class VoiceMonitor:
         # A roll call interrupted by the restart is cancelled, never enforced:
         # nobody gets disconnected because the bot was offline.
         self.alive_checks.bind(state.event_uid)
+        self.engine.hell_events.bind(state.event_uid, now=now_ts())
+        self.engine.finale.bind(state.event_uid)
         pending_check = self.alive_checks.pending
         if pending_check is not None:
             recovered = await self.alive_checks.backfill_replies()
@@ -478,6 +525,7 @@ class VoiceMonitor:
         self.announcer.forget_progress_message()
         self._terminal_rendered = False
         await self.announcer.update_progress(self.engine.snapshot(), force=True)
+        self.sync_status()
 
         # Let the guild know the bot recovered from a restart.
         if gap > 10.0:
@@ -487,10 +535,11 @@ class VoiceMonitor:
                     f"The bot was restarted and is back online. "
                     f"The event was unobserved for **{gap:.0f}s** — "
                     f"the timer never stopped and nobody was penalised. "
-                    f"Elapsed: **{format_hm(self.engine.elapsed())}** / 160h."
+                    f"Elapsed: **{format_hm(self.engine.elapsed())}** / {format_hm(self.engine.state.total_seconds)}."
                 ),
-                color=0xE25822,
+                color=theme_color("RUNNING"),
             )
+            self.announcer.embeds._brand(embed)
             try:
                 await self.announcer.send([embed])
             except Exception:

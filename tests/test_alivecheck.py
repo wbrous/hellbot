@@ -9,7 +9,7 @@ import pytest
 
 from hell.alivecheck import CHECK_TEXT, AliveCheckManager, is_valid_reply
 from hell.models import EventStatus
-from tests.conftest import T0, empty_out, make_config, obs, start, users
+from tests.conftest import T0, make_config, obs, start, users
 
 HOUR = 3600.0
 MINUTE = 60.0
@@ -22,6 +22,7 @@ class FakeIO:
         self.sent: list[tuple[str, list[int]]] = []
         self.results: list[str] = []
         self.kicked: list[list[int]] = []
+        self.muted: list[tuple[int, int, str]] = []  # (user_id, duration_seconds, reason)
         self.present: set[int] = set()          # who is actually in the VC
         self.offline_replies: set[int] = set()  # answers found after a restart
         self.fail_send = fail_send
@@ -41,6 +42,10 @@ class FakeIO:
         self.present -= set(removed)
         return removed
 
+    async def mute(self, user_id, duration_seconds, reason):
+        self.muted.append((user_id, duration_seconds, reason))
+        return True
+
     async def replies_since(self, channel_id, message_id, user_ids):
         return set(self.offline_replies) & set(user_ids)
 
@@ -59,12 +64,16 @@ def alive(store, config):
 
 # ------------------------------------------------------------- reply parsing
 
-@pytest.mark.parametrize("text", ["Yes", "yes", "YES", " Yes ", "yes!", "Yes."])
+@pytest.mark.parametrize(
+    "text",
+    ["Yes", "yes", "YES", " Yes ", "yes!", "Yes.", "Yeah", "YEP", "yup", "y", "si", "sí",
+     "okay", "OK", "I'm alive!", "yes i am", "affirmative", "aye"],
+)
 def test_accepted_replies(text):
     assert is_valid_reply(text)
 
 
-@pytest.mark.parametrize("text", ["y", "yeah", "yes i am", "no", "", "si", "yesss"])
+@pytest.mark.parametrize("text", ["no", "nope", "nah", "", "yesss"])
 def test_rejected_replies(text):
     assert not is_valid_reply(text)
 
@@ -159,6 +168,63 @@ def test_only_silent_users_are_kicked(alive, store):
     assert [p.user_id for p in result.kicked] == [3]
     assert io.kicked == [[3]]
     assert manager.pending is None
+
+
+def test_alive_check_finishes_as_soon_as_everyone_answers(alive, store):
+    manager, io = alive
+    io.present = {1, 2}
+    store.set_next_alive_check("uid", T0)
+    run(manager.tick(T0 + 1, users(1, 2)))
+
+    assert manager.register_reply(1, "yeah", channel_id=999)
+    # Nobody has to wait for the 5-minute deadline: the final reply resolves it.
+    assert manager.register_reply(2, "yep", channel_id=999)
+    result = run(manager.tick(T0 + 2, users(1, 2)))
+    assert result is not None
+    assert [p.user_id for p in result.responded] == [1, 2]
+    assert result.kicked == []
+    assert manager.pending is None
+    assert "Alive check finished" in io.results[-1]
+
+
+def test_final_reply_resolves_immediately(alive, store):
+    manager, io = alive
+    io.present = {1, 2}
+    store.set_next_alive_check("uid", T0)
+    run(manager.tick(T0 + 1, users(1, 2)))
+
+    run(manager.process_reply(1, "sure", channel_id=999))
+    assert manager.pending is not None
+
+    result = run(manager.process_reply(2, "yes please", channel_id=999))
+    assert result == "yes"
+    assert manager.pending is None
+    assert "Alive check finished" in io.results[-1]
+    assert io.kicked == []
+
+
+def test_no_reply_kicks_and_says_alright_then(alive, store):
+    manager, io = alive
+    io.present = {1, 2}
+    store.set_next_alive_check("uid", T0)
+    run(manager.tick(T0 + 1, users(1, 2)))
+
+    result = run(manager.process_reply(1, "No", channel_id=999))
+    assert result == "no"
+    assert io.kicked == [[1]]
+    assert io.results[-1] == "Alright then"
+    assert manager.pending.declined == {1}
+    assert manager.pending.declined_kicked == {1}
+    assert 1 in manager.pending.responded
+
+    # User 2 still needs to answer; the check is not finished yet.
+    assert manager.pending is not None
+
+    # The final reply resolves the check and the result shows the declined kick.
+    result = run(manager.process_reply(2, "Yep", channel_id=999))
+    assert result == "yes"
+    assert manager.pending is None
+    assert "<@1>" in io.results[-1]
 
 
 def test_reply_in_another_channel_does_not_count(alive, store):
@@ -313,6 +379,25 @@ def test_kicked_user_keeps_leaderboard_time_and_can_return(engine, store, config
     assert resumed[2] > after_kick[2]                        # tracking resumed
 
 
+def test_all_no_replies_resolve_early_and_record_emptied_vc(engine, store, config):
+    io = FakeIO()
+    io.present = {1, 2}
+    manager = AliveCheckManager(config, store, io, rng=random.Random(5), engine=engine)
+    start(engine, T0, 1, 2)
+    manager.bind(engine.event_uid, now=T0)
+    store.set_next_alive_check(engine.event_uid, T0)
+    run(manager.tick(T0 + 1, users(1, 2)))
+
+    run(manager.process_reply(1, "No", channel_id=999))
+    # The second No kicks the last user and resolves the check immediately.
+    result = run(manager.process_reply(2, "No", channel_id=999))
+    assert result == "no"
+    assert manager.pending is None
+    assert io.kicked == [[1], [2]]
+    # The engine is told the alive check itself emptied the VC.
+    assert engine._alive_check_emptied_ts is not None
+
+
 def test_event_survives_a_kick_while_someone_remains(engine, store, config):
     io = FakeIO()
     io.present = {1, 2}
@@ -329,7 +414,7 @@ def test_event_survives_a_kick_while_someone_remains(engine, store, config):
 
 
 def test_event_fails_if_everyone_ignores_the_check(engine, store, config):
-    """Nobody answers -> everyone is disconnected -> the VC empties -> FAILED."""
+    """Nobody answers -> everyone is disconnected -> the VC empties -> 2-min recovery grace -> FAILED."""
     io = FakeIO()
     io.present = {1, 2}
     manager = AliveCheckManager(config, store, io, rng=random.Random(5))
@@ -339,10 +424,47 @@ def test_event_fails_if_everyone_ignores_the_check(engine, store, config):
     run(manager.tick(T0 + 1, users(1, 2)))
     result = run(manager.tick(T0 + 1 + 5 * MINUTE, users(1, 2)))
     assert sorted(p.user_id for p in result.kicked) == [1, 2]
+    assert result.emptied_vc
 
-    _opened, expired = empty_out(engine, T0 + 2 + 5 * MINUTE)
+    t_empty = T0 + 2 + 5 * MINUTE
+    opened = engine.tick(obs(t_empty))
+    assert opened and opened[0].seconds == 120.0  # 2-minute recovery grace period
+
+    # After normal 15s grace, still RUNNING because of 2-minute recovery period
+    engine.tick(obs(t_empty + 15.0))
+    assert engine.status is EventStatus.RUNNING
+
+    # After 120s without anyone returning, the event FAILS
+    expired = engine.tick(obs(t_empty + 120.0))
     assert engine.status is EventStatus.FAILED
     assert expired and type(expired[0]).__name__ == "EventFailed"
+
+
+def test_alive_check_recovery_grace_recovers_if_someone_returns(engine, store, config):
+    """Nobody answers -> disconnected -> 2-min recovery grace starts -> user returns at 60s -> run continues."""
+    io = FakeIO()
+    io.present = {1, 2}
+    manager = AliveCheckManager(config, store, io, rng=random.Random(5))
+    start(engine, T0, 1, 2)
+    manager.bind(engine.event_uid, now=T0)
+    store.set_next_alive_check(engine.event_uid, T0)
+    run(manager.tick(T0 + 1, users(1, 2)))
+    result = run(manager.tick(T0 + 1 + 5 * MINUTE, users(1, 2)))
+    assert result.emptied_vc
+
+    t_empty = T0 + 2 + 5 * MINUTE
+    opened = engine.tick(obs(t_empty))
+    assert opened and opened[0].seconds == 120.0
+
+    # User 1 rejoins at 60s (within 2-min recovery period)
+    recovered = engine.tick(obs(t_empty + 60.0, 1))
+    assert engine.status is EventStatus.RUNNING
+    assert recovered and type(recovered[0]).__name__ == "GraceRecovered"
+
+    # Future regular empty-VC uses the normal 15s grace period
+    t_normal_empty = t_empty + 100.0
+    normal_opened = engine.tick(obs(t_normal_empty))
+    assert normal_opened and normal_opened[0].seconds == 15.0
 
 
 def test_disabled_checks_never_fire(tmp_path, store):

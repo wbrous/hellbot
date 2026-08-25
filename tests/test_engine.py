@@ -463,3 +463,144 @@ def test_completion_after_a_pause_counts_exactly_160h(engine):
     engine.tick(obs(T0 + 159 * HOUR + 3 * HOUR + 3601, 1))  # effective 160h 1s
     assert engine.status is EventStatus.COMPLETED
     assert engine.elapsed() == pytest.approx(TOTAL_SECONDS)  # clamped, not 163h
+
+
+def test_resume_failed_run(engine):
+    start(engine, T0, 1)
+    engine.tick(obs(T0 + 100, 1))
+    assert engine.elapsed(T0 + 100) == pytest.approx(100.0)
+
+    # Empty VC -> fails after grace
+    engine.tick(obs(T0 + 101))
+    engine.tick(obs(T0 + 101 + GRACE))
+    assert engine.status is EventStatus.FAILED
+    assert engine.elapsed(T0 + 500) == pytest.approx(101.0)
+
+    # Resume the failed run at T0 + 500
+    engine.resume_failed(now=T0 + 500)
+    assert engine.status is EventStatus.RUNNING
+    assert engine.elapsed(T0 + 500) == pytest.approx(101.0)
+
+    # Further ticks continue the clock
+    engine.tick(obs(T0 + 501, 1))
+    assert engine.elapsed(T0 + 501) == pytest.approx(102.0)
+    board = {e.user_id: e.seconds for e in engine.leaderboard()}
+    assert board[1] == pytest.approx(101.0)
+
+
+def test_resume_failed_when_not_failed_is_refused(engine):
+    start(engine, T0, 1)
+    with pytest.raises(StartError, match="not failed"):
+        engine.resume_failed(now=T0 + 10)
+
+
+# ------------------------------------------------------- Hell 2 continuation
+
+
+def _complete_160h(engine):
+    start(engine, T0, 1, 2)
+    events = engine.tick(obs(T0 + TOTAL_SECONDS, 1, 2))
+    assert engine.status is EventStatus.COMPLETED
+    return events
+
+
+def test_resume_continuation_extends_to_320h_without_milestones(engine, store):
+    _complete_160h(engine)
+    store.record_continuation_vote(engine.event_uid, 1, "yes", T0)
+    store.record_continuation_vote(engine.event_uid, 2, "yes", T0)
+
+    # Wait 2 hours before the host resumes; that time is banked, not counted.
+    resume_at = T0 + TOTAL_SECONDS + 2 * HOUR
+    engine.resume_continuation(now=resume_at)
+    assert engine.status is EventStatus.RUNNING
+    assert engine.is_continuation
+    assert engine.state.total_seconds == 320 * HOUR
+    assert not engine.state.milestones_enabled
+    assert engine.elapsed(resume_at) == pytest.approx(TOTAL_SECONDS)
+
+    # Past the old 160h point there are no milestone events.
+    tick_at = resume_at + 100
+    events = engine.tick(obs(tick_at, 1))
+    assert not [e for e in events if isinstance(e, MilestoneReached)]
+    assert engine.status is EventStatus.RUNNING
+    assert engine.elapsed(tick_at) == pytest.approx(TOTAL_SECONDS + 100)
+
+    # Completion happens at 320h of effective event time.
+    finish_at = resume_at + (320 * HOUR - TOTAL_SECONDS)
+    events = engine.tick(obs(finish_at, 1))
+    completed = next(e for e in events if isinstance(e, EventCompleted))
+    assert engine.status is EventStatus.COMPLETED
+    assert completed.continuation is True
+    assert engine.state.total_seconds == 320 * HOUR
+
+
+def test_resume_continuation_requires_yes_majority(engine, store):
+    _complete_160h(engine)
+    store.record_continuation_vote(engine.event_uid, 1, "no", T0)
+    store.record_continuation_vote(engine.event_uid, 2, "no", T0)
+    with pytest.raises(StartError, match="vote has not passed"):
+        engine.resume_continuation(now=T0 + TOTAL_SECONDS + 1, approved=False)
+
+
+def test_resume_continuation_not_allowed_on_a_failed_run(engine):
+    start(engine, T0, 1)
+    engine.tick(obs(T0 + 1))
+    engine.tick(obs(T0 + 1 + GRACE))
+    with pytest.raises(StartError, match="not completed"):
+        engine.resume_continuation(now=T0 + 1000)
+
+
+def test_alive_check_recovery_grace_duration(engine):
+    start(engine, T0, 1)
+    engine.tick(obs(T0 + 60, 1))
+
+    # Simulate alive check emptying the VC
+    engine.notify_alive_check_emptied(T0 + 61)
+    opened = engine.tick(obs(T0 + 61))
+    assert opened and opened[0].seconds == 120.0
+    assert engine.grace.seconds == 120.0
+
+    # 15s in -> still running (not expired)
+    engine.tick(obs(T0 + 61 + 15))
+    assert engine.status is EventStatus.RUNNING
+
+    # 60s in -> still running
+    engine.tick(obs(T0 + 61 + 60))
+    assert engine.status is EventStatus.RUNNING
+
+    # 120s in -> expires and fails
+    expired = engine.tick(obs(T0 + 61 + 120))
+    assert engine.status is EventStatus.FAILED
+    assert expired and type(expired[0]).__name__ == "EventFailed"
+
+
+def test_alive_check_recovery_grace_survives_restart(tmp_path):
+    from hell.storage import Store
+
+    config = make_config(tmp_path)
+    store = Store(config.database_path)
+    engine = HellEngine(store, config)
+    start(engine, T0, 1)
+    engine.tick(obs(T0 + 60, 1))
+    engine.notify_alive_check_emptied(T0 + 61)
+    engine.tick(obs(T0 + 61))
+    assert engine.grace.seconds == 120.0
+    store.close()
+
+    # Restart mid-recovery-grace
+    store2 = Store(config.database_path)
+    engine2 = HellEngine(store2, config)
+    assert engine2.grace.is_open
+    assert engine2.grace.seconds == 120.0
+    assert engine2.grace.deadline() == T0 + 61 + 120.0
+
+    # Tick before 120s -> still running
+    engine2.tick(obs(T0 + 61 + 50))
+    assert engine2.status is EventStatus.RUNNING
+
+    # Recover by joining
+    recovered = engine2.tick(obs(T0 + 61 + 70, 1))
+    assert engine2.status is EventStatus.RUNNING
+    assert recovered and type(recovered[0]).__name__ == "GraceRecovered"
+    assert engine2.grace.seconds == config.empty_vc_grace_seconds
+    store2.close()

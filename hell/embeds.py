@@ -20,6 +20,7 @@ import discord
 
 from . import assets
 from .config import Config
+from .difficulty import DifficultyInfo
 from .engine import (
     EventCancelled,
     EventCompleted,
@@ -29,11 +30,19 @@ from .engine import (
     MilestoneReached,
     Snapshot,
 )
+from .finale import FinaleAnnouncement
+from .hellevents import HellEventEnded, HellEventStarted
 from .leaderboard import format_entry, format_entry_live, top_n
 from .milestones import MILESTONES
 from .models import EventStatus, LeaderboardEntry, MilestoneRecord, ParticipantRef
 from .texts import TEXT, say
-from .timeutil import discord_ts, format_hm, format_hms, milestone_bar
+from .timeutil import (
+    discord_ts,
+    format_hm,
+    format_hms,
+    milestone_bar,
+    milestone_progress_bar,
+)
 
 log = logging.getLogger("hell.embeds")
 
@@ -59,15 +68,34 @@ def status_emoji(status: EventStatus) -> str:
 def status_color(status: EventStatus) -> int:
     return theme_color(status.value, theme_color("RUNNING"))
 
-def bar(fraction: float) -> str:
-    """The milestone-segmented progress bar, styled from Announcements.py."""
+def bar(fraction: float, *, elapsed: Optional[float] = None) -> str:
+    """The milestone-segmented progress bar, styled from Announcements.py.
+
+    When ``elapsed`` is supplied (the running live message), each divided line
+    fills progressively as *its* milestone approaches: completed milestones stay
+    full, the current one fills on the way there, and locked ones stay empty.
+    Without ``elapsed`` it falls back to a plain overall-progress bar.
+    """
+    cells_per_block = int(getattr(TEXT, "BAR_CELLS_PER_MILESTONE", 4))
+    full = str(getattr(TEXT, "BAR_FULL", "▰"))
+    empty = str(getattr(TEXT, "BAR_EMPTY", "▱"))
+    separator = str(getattr(TEXT, "BAR_SEPARATOR", "┃"))
+    if elapsed is not None and MILESTONES:
+        return milestone_progress_bar(
+            elapsed,
+            [m.seconds for m in MILESTONES],
+            cells_per_block=cells_per_block,
+            full=full,
+            empty=empty,
+            separator=separator,
+        )
     return milestone_bar(
         fraction,
         blocks=max(1, len(MILESTONES)),
-        cells_per_block=int(getattr(TEXT, "BAR_CELLS_PER_MILESTONE", 4)),
-        full=str(getattr(TEXT, "BAR_FULL", "▰")),
-        empty=str(getattr(TEXT, "BAR_EMPTY", "▱")),
-        separator=str(getattr(TEXT, "BAR_SEPARATOR", "┃")),
+        cells_per_block=cells_per_block,
+        full=full,
+        empty=empty,
+        separator=separator,
     )
 
 def dots(reached: int, total: Optional[int] = None) -> str:
@@ -211,16 +239,49 @@ class EmbedFactory:
         return embed
 
     def progress(self, snap: Snapshot) -> discord.Embed:
+        title = say(TEXT.PROGRESS_TITLE, emoji=status_emoji(snap.status))
+        desc = say(
+            TEXT.PROGRESS_DESCRIPTION,
+            bar=bar(snap.fraction, elapsed=snap.elapsed),
+            elapsed=format_hm(snap.elapsed),
+            total=format_hm(snap.total),
+            percent=f"{snap.fraction * 100:.1f}%",
+            dots=dots(reached_count(snap.elapsed)),
+        )
+        if snap.status is EventStatus.RUNNING:
+            if snap.continuation:
+                title = str(getattr(TEXT, "PROGRESS_TITLE_CONTINUATION", "🔥 HELL 2 — KEEP ON HELL"))
+                desc = (
+                    f"`{bar(snap.fraction)}`\n"
+                    f"**{format_hm(snap.elapsed)}** of {format_hm(snap.total)}  ·  **{snap.fraction * 100:.1f}%**\n\n"
+                    f"🔒 **No milestones. One final and secret reward at {format_hm(snap.total)}.**"
+                )
+                if snap.remaining <= 60:
+                    desc = (
+                        f"`{bar(snap.fraction)}`\n"
+                        f"**{format_hm(snap.elapsed)}** of {format_hm(snap.total)}  ·  **{snap.fraction * 100:.1f}%**\n\n"
+                        f"👹 **FINAL COUNTDOWN: `{int(snap.remaining)}` SECONDS**\n"
+                        f"**DO NOT LET HELL GO EMPTY.**"
+                    )
+            elif snap.countdown_seconds is not None:
+                title = str(getattr(TEXT, "PROGRESS_TITLE_COUNTDOWN", "👹 FINAL COUNTDOWN"))
+                desc = (
+                    f"`{bar(snap.fraction, elapsed=snap.elapsed)}`\n"
+                    f"**{format_hm(snap.elapsed)}** of {format_hm(snap.total)}  ·  **{snap.fraction * 100:.1f}%**\n\n"
+                    f"👹 **FINAL COUNTDOWN: `{snap.countdown_seconds}` SECONDS REMAINING**\n"
+                    f"**DO NOT LET HELL GO EMPTY.**"
+                )
+            elif snap.is_final_hour:
+                title = str(getattr(TEXT, "PROGRESS_TITLE_FINAL_HOUR", "👹 THE FINAL HOUR"))
+                desc = (
+                    f"`{bar(snap.fraction, elapsed=snap.elapsed)}`\n"
+                    f"**{format_hm(snap.elapsed)}** of {format_hm(snap.total)}  ·  **{snap.fraction * 100:.1f}%**  ·  {dots(reached_count(snap.elapsed))}\n\n"
+                    f"👹 **1 HOUR REMAINING — DO NOT LET HELL GO EMPTY.**"
+                )
+
         embed = discord.Embed(
-            title=say(TEXT.PROGRESS_TITLE, emoji=status_emoji(snap.status)),
-            description=say(
-                TEXT.PROGRESS_DESCRIPTION,
-                bar=bar(snap.fraction),
-                elapsed=format_hm(snap.elapsed),
-                total=format_hm(snap.total),
-                percent=f"{snap.fraction * 100:.1f}%",
-                dots=dots(reached_count(snap.elapsed)),
-            ),
+            title=title,
+            description=desc,
             color=status_color(snap.status),
         )
         self._brand(embed, thumbnail=getattr(TEXT, "PROGRESS_THUMBNAIL", ""))
@@ -240,20 +301,32 @@ class EmbedFactory:
             value=say(TEXT.PROGRESS_PEOPLE_VALUE, participants=snap.participants),
             inline=True,
         )
+        rem_val = (
+            str(getattr(TEXT, "PROGRESS_REMAINING_BLIND", "👁️ *[HIDDEN BY BLINDNESS]*"))
+            if snap.blindness_active and snap.status is EventStatus.RUNNING
+            else say(TEXT.PROGRESS_REMAINING_VALUE, remaining=format_hm(snap.remaining))
+        )
         embed.add_field(
             name=TEXT.PROGRESS_REMAINING_FIELD,
-            value=say(TEXT.PROGRESS_REMAINING_VALUE, remaining=format_hm(snap.remaining)),
+            value=rem_val,
             inline=True,
         )
 
-        current = (
-            say(TEXT.PROGRESS_CURRENT_VALUE, current_milestone=snap.current.hours)
-            if snap.current
-            else TEXT.PROGRESS_CURRENT_NONE
-        )
+        if snap.continuation:
+            current = str(getattr(TEXT, "PROGRESS_CURRENT_CONTINUATION", "🔒 No milestones — only the final 320h reward"))
+        else:
+            current = (
+                say(TEXT.PROGRESS_CURRENT_VALUE, current_milestone=snap.current.hours)
+                if snap.current
+                else TEXT.PROGRESS_CURRENT_NONE
+            )
         embed.add_field(name=TEXT.PROGRESS_CURRENT_FIELD, value=current, inline=True)
 
-        if snap.upcoming and snap.time_to_next is not None:
+        if snap.continuation:
+            nxt = str(getattr(TEXT, "PROGRESS_NEXT_CONTINUATION", "🔒 Final secret reward at 320h"))
+        elif snap.blindness_active and snap.status is EventStatus.RUNNING:
+            nxt = str(getattr(TEXT, "PROGRESS_NEXT_BLIND", "👁️ *[HIDDEN BY BLINDNESS]*"))
+        elif snap.upcoming and snap.time_to_next is not None:
             # While paused the live countdown tag is meaningless (the clock is
             # frozen), so fall back to the static "in X" rendering.
             running = snap.status is EventStatus.RUNNING and snap.start_ts and not snap.paused
@@ -287,9 +360,12 @@ class EmbedFactory:
                 inline=False,
             )
         elif snap.status is EventStatus.COMPLETED:
-            embed.add_field(
-                name=TEXT.PROGRESS_COMPLETED_FIELD, value=TEXT.PROGRESS_COMPLETED_TEXT, inline=False
+            value = (
+                str(getattr(TEXT, "PROGRESS_COMPLETED_CONTINUATION_TEXT", "320H Hell 2 survived. The final secret reward is theirs."))
+                if snap.continuation
+                else TEXT.PROGRESS_COMPLETED_TEXT
             )
+            embed.add_field(name=TEXT.PROGRESS_COMPLETED_FIELD, value=value, inline=False)
         elif snap.status is EventStatus.CANCELLED:
             embed.add_field(
                 name=TEXT.PROGRESS_CANCELLED_FIELD,
@@ -583,38 +659,74 @@ class EmbedFactory:
     def completion(self, event: EventCompleted) -> list[discord.Embed]:
         board = event.leaderboard
         podium = top_n(board, 3)
-        fields = dict(
-            vc=f"<#{self.config.voice_channel_id}>",
-            completed_at=discord_ts(event.completed_ts, "F"),
-            final_reward=self.reward(MILESTONES[-1]),
-            all_rewards=", ".join(
-                self.reward(m, short=True) for m in MILESTONES
-            ),
-            bonus_role=self.config.role_mention(
-                self.config.cool_people_role_id, TEXT.TOP3_BONUS_ROLE
-            ),
-        )
+        continuation = bool(getattr(event, "continuation", False))
+        if continuation:
+            title = say(getattr(TEXT, "CONTINUATION_COMPLETION_TITLE", "🏆🔥 HELL 2 — 320H SURVIVED"), vc=f"<#{self.config.voice_channel_id}>")
+            description = say(
+                getattr(
+                    TEXT,
+                    "CONTINUATION_COMPLETION_DESCRIPTION",
+                    "The full **320H** Hell 2 challenge has been survived. "
+                    "The final, secret reward is now yours.",
+                ),
+                vc=f"<#{self.config.voice_channel_id}>",
+                completed_at=discord_ts(event.completed_ts, "F"),
+            )
+            fields = dict(
+                vc=f"<#{self.config.voice_channel_id}>",
+                completed_at=discord_ts(event.completed_ts, "F"),
+                final_reward=str(getattr(TEXT, "CONTINUATION_SECRET_REWARD", "🔒 *A final and secret reward*")),
+                all_rewards="",
+                bonus_role="",
+            )
+            reward_field = getattr(TEXT, "CONTINUATION_COMPLETION_REWARD_FIELD", "🎁 Final secret reward")
+            reward_text = getattr(TEXT, "CONTINUATION_COMPLETION_REWARD_TEXT", "{final_reward}\n*Only those who survived to 320h.*")
+        else:
+            fields = dict(
+                vc=f"<#{self.config.voice_channel_id}>",
+                completed_at=discord_ts(event.completed_ts, "F"),
+                final_reward=self.reward(MILESTONES[-1]),
+                all_rewards=", ".join(
+                    self.reward(m, short=True) for m in MILESTONES
+                ),
+                bonus_role=self.config.role_mention(
+                    self.config.cool_people_role_id, TEXT.TOP3_BONUS_ROLE
+                ),
+            )
+            title = say(getattr(TEXT, "COMPLETION_FINALE_TITLE", TEXT.COMPLETION_TITLE), **fields)
+            description = say(getattr(TEXT, "COMPLETION_FINALE_DESCRIPTION", TEXT.COMPLETION_DESCRIPTION), **fields)
+            reward_field = TEXT.COMPLETION_REWARD_FIELD
+            reward_text = TEXT.COMPLETION_REWARD_TEXT
+
         embed = discord.Embed(
-            title=say(TEXT.COMPLETION_TITLE, **fields),
-            description=say(TEXT.COMPLETION_DESCRIPTION, **fields),
+            title=title,
+            description=description,
             color=theme_color("COMPLETED"),
         )
         embed.add_field(
-            name=say(TEXT.COMPLETION_REWARD_FIELD, **fields),
-            value=say(TEXT.COMPLETION_REWARD_TEXT, **fields),
+            name=say(reward_field, **fields),
+            value=say(reward_text, **fields),
             inline=False,
         )
-        add_chunked_field(
-            embed,
-            say(TEXT.COMPLETION_TOP3_FIELD, **fields),
-            say(TEXT.COMPLETION_TOP3_TEXT, **fields),
-        )
-        add_chunked_field(
-            embed,
-            say(TEXT.COMPLETION_PODIUM_FIELD, **fields),
-            "\n".join(format_entry(e) for e in podium) or TEXT.COMPLETION_PODIUM_NONE,
-        )
-        embed.set_footer(text=say(TEXT.COMPLETION_FOOTER, **fields))
+        if not continuation:
+            add_chunked_field(
+                embed,
+                say(TEXT.COMPLETION_TOP3_FIELD, **fields),
+                say(TEXT.COMPLETION_TOP3_TEXT, **fields),
+            )
+            add_chunked_field(
+                embed,
+                say(TEXT.COMPLETION_PODIUM_FIELD, **fields),
+                "\n".join(format_entry(e) for e in podium) or TEXT.COMPLETION_PODIUM_NONE,
+            )
+        if getattr(event, "peak_population", 0) > 0:
+            embed.add_field(
+                name="👥 Peak Hell Population",
+                value=f"**{event.peak_population}** contestants inside simultaneously",
+                inline=True,
+            )
+        footer = getattr(TEXT, "CONTINUATION_COMPLETION_FOOTER", "320h · no milestones · final secret reward") if continuation else TEXT.COMPLETION_FOOTER
+        embed.set_footer(text=say(footer, **fields) if not continuation else footer)
         self._brand(embed, image=getattr(TEXT, "COMPLETION_IMAGE", ""))
         return [
             embed,
@@ -624,6 +736,87 @@ class EmbedFactory:
                 color=theme_color("COMPLETED"),
             ),
         ]
+
+    def continuation_resume(self) -> discord.Embed:
+        """Hell 2 start: 320h, no milestones, only a secret final reward."""
+        fields = dict(
+            hours=320,
+            vc=f"<#{self.config.voice_channel_id}>",
+        )
+        embed = discord.Embed(
+            title=say(getattr(TEXT, "CONTINUATION_RESUME_TITLE", "🔥 HELL 2 — THE KEEP ON HELL CHALLENGE"), **fields),
+            description=say(
+                getattr(
+                    TEXT,
+                    "CONTINUATION_RESUME_DESCRIPTION",
+                    "Hell is not over. The same run now continues to **320 hours**. "
+                    "There are no more milestones — only one final and secret reward.",
+                ),
+                **fields,
+            ),
+            color=theme_color("CONTINUATION", theme_color("RUNNING")),
+        )
+        embed.add_field(
+            name=getattr(TEXT, "CONTINUATION_RESUME_RULE_FIELD", "📜 The rule"),
+            value=getattr(
+                TEXT,
+                "CONTINUATION_RESUME_RULE",
+                "• Keep at least one real human in **{vc}** until **320h**.\n"
+                "• No milestones will be announced after 160h.\n"
+                "• At **320h**, a final and secret reward awaits the survivors.",
+            ).format(**fields),
+            inline=False,
+        )
+        embed.set_footer(text=getattr(TEXT, "CONTINUATION_RESUME_FOOTER", "320h · no milestones · secret reward"))
+        self._brand(embed, thumbnail=getattr(TEXT, "PROGRESS_THUMBNAIL", ""))
+        return embed
+
+    def hell_event_start(self, event: HellEventStarted) -> discord.Embed:
+        rec = event.record
+        embed = discord.Embed(
+            title=say(
+                getattr(TEXT, "HELL_EVENT_TITLE", "⚡ HELL EVENT — {name}"),
+                name=rec.name.upper(),
+            ),
+            description=event.announcement_text,
+            color=theme_color("RUNNING"),
+        )
+        if rec.end_ts > rec.start_ts:
+            embed.add_field(
+                name="⏳ Duration",
+                value=f"**{int((rec.end_ts - rec.start_ts) // 60)} minutes** (ends <t:{int(rec.end_ts)}:R>)",
+                inline=True,
+            )
+        if event.eligible_participants:
+            add_chunked_field(
+                embed,
+                f"👥 Eligible ({len(event.eligible_participants)})",
+                format_members(event.eligible_participants),
+            )
+        embed.set_footer(text="Hell Event active · Dynamic survival modifiers applied")
+        self._brand(embed, timestamp=True)
+        return embed
+
+    def hell_event_end(self, event: HellEventEnded) -> discord.Embed:
+        rec = event.record
+        embed = discord.Embed(
+            title=f"⚡ HELL EVENT CONCLUDED — {rec.name.upper()}",
+            description=event.announcement_text,
+            color=theme_color("RUNNING"),
+        )
+        embed.set_footer(text="Modifiers returned to normal · Keep surviving")
+        self._brand(embed, timestamp=True)
+        return embed
+
+    def finale_stage(self, ann: FinaleAnnouncement) -> discord.Embed:
+        embed = discord.Embed(
+            title=ann.title,
+            description=ann.description,
+            color=theme_color("RUNNING"),
+        )
+        embed.set_footer(text="The 160-Hour Finale · Keep the voice channel alive!")
+        self._brand(embed, timestamp=True)
+        return embed
 
     def leaderboard(
         self,
@@ -744,6 +937,17 @@ class EmbedFactory:
         alive_line: Optional[str] = None,
     ) -> discord.Embed:
         embed = self.progress(snap)
+        from .difficulty import get_difficulty
+        diff = get_difficulty(snap.elapsed)
+        embed.add_field(
+            name=str(getattr(TEXT, "DIFFICULTY_STATUS_FIELD", "⚡ Difficulty")),
+            value=say(
+                str(getattr(TEXT, "DIFFICULTY_STATUS_VALUE", "**Level {level}** — {name}")),
+                level=diff.level,
+                name=diff.name,
+            ) + f"\n*{diff.description}*",
+            inline=False,
+        )
         if alive_line:
             embed.add_field(name="🚨 Alive checks", value=alive_line, inline=False)
         records = list(milestone_records)
@@ -757,4 +961,83 @@ class EmbedFactory:
                     for r in records
                 ),
             )
+        return embed
+
+    def difficulty_info(self, elapsed: float, override: Optional[int] = None) -> discord.Embed:
+        """Overview of the 5 difficulty tiers and current state."""
+        from .difficulty import DIFFICULTIES, get_difficulty
+
+        current = get_difficulty(elapsed, override=override)
+        embed = discord.Embed(
+            title=str(getattr(TEXT, "CMD_DIFFICULTY_TITLE", "⚡ WELCOME TO HELL — DIFFICULTIES")),
+            description=str(getattr(TEXT, "CMD_DIFFICULTY_DESCRIPTION", "Difficulties make the challenge progressively harder at each milestone reached.")),
+            color=theme_color("RUNNING"),
+        )
+        embed.add_field(
+            name="⚡ Current Difficulty",
+            value=f"**Level {current.level}** — **{current.name}**\n*{current.description}*",
+            inline=False,
+        )
+        for lvl in range(5):
+            d = DIFFICULTIES[lvl]
+            unlocked = "✅ Active" if current.level >= lvl else f"🔒 Unlocks at {d.unlock_hours}h"
+            active_marker = " 👈 (CURRENT)" if current.level == lvl else ""
+            dead_info = "Disabled"
+            if d.dead_checks_enabled:
+                if d.min_mute_seconds == d.max_mute_seconds:
+                    dead_info = f"Enabled ({d.min_mute_seconds // 60}m mute on reply)"
+                else:
+                    dead_info = f"Enabled ({d.min_mute_seconds // 60}–{d.max_mute_seconds // 60}m mute on reply)"
+            gamble_info = "Locked"
+            if d.gamble_enabled:
+                gamble_info = (
+                    f"Active (`/hell gamble [hours]` / `!gamble [hours]`) — "
+                    f"Win: **+{d.gamble_win_multiplier:g}x** ({int(d.gamble_win_chance * 100)}% odds), "
+                    f"Lose: **-1.0x** + {d.gamble_loss_mute_seconds // 60}m mute | "
+                    f"Limits: max **{d.gamble_max_bet_hours:g}h** bet, max **{d.gamble_hourly_limit}/hour**"
+                )
+            embed.add_field(
+                name=f"Level {d.level}: {d.name} — {unlocked}{active_marker}",
+                value=f"• **Alive checks:** every {d.min_check_hours:g}–{d.max_check_hours:g}h\n"
+                      f"• **Dead checks:** {dead_info}\n"
+                      f"• **Gambling:** {gamble_info}",
+                inline=False,
+            )
+        self._brand(embed, timestamp=False)
+        return embed
+
+    def difficulty_announcement(self, diff: DifficultyInfo) -> discord.Embed:
+        """Announcement embed for a difficulty change/unlock."""
+        dead_info = "Disabled"
+        if diff.dead_checks_enabled:
+            if diff.min_mute_seconds == diff.max_mute_seconds:
+                dead_info = f"Enabled ({diff.min_mute_seconds // 60}m mute on reply)"
+            else:
+                dead_info = f"Enabled ({diff.min_mute_seconds // 60}–{diff.max_mute_seconds // 60}m mute on reply)"
+        gamble_info = "Locked"
+        if diff.gamble_enabled:
+            gamble_info = (
+                f"Active (`/hell gamble [hours]` / `!gamble [hours]`) — "
+                f"Win: **+{diff.gamble_win_multiplier:g}x** ({int(diff.gamble_win_chance * 100)}% odds), "
+                f"Lose: **-1.0x** + {diff.gamble_loss_mute_seconds // 60}m mute | "
+                f"Limits: max **{diff.gamble_max_bet_hours:g}h** bet, max **{diff.gamble_hourly_limit}/hour**"
+            )
+
+        embed = discord.Embed(
+            title=say(
+                getattr(TEXT, "DIFFICULTY_ANNOUNCE_TITLE", "⚡ DIFFICULTY UPDATE — LEVEL {level} ({name})"),
+                level=diff.level,
+                name=diff.name,
+            ),
+            description=(
+                f"**Welcome to Hell is now at Difficulty Level {diff.level}: {diff.name}!** 🔥\n\n"
+                f"*{diff.description}*\n\n"
+                f"• **Alive checks:** every **{diff.min_check_hours:g}–{diff.max_check_hours:g}h**\n"
+                f"• **Dead checks:** **{dead_info}**\n"
+                f"• **Gambling:** **{gamble_info}**"
+            ),
+            color=theme_color("RUNNING"),
+        )
+        embed.set_footer(text="Survive the challenge · Use /hell difficulty or /hell gamble")
+        self._brand(embed, timestamp=True)
         return embed
