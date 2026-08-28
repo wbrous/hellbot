@@ -42,10 +42,11 @@ from .engine import (
     Observation,
 )
 from .models import EventStatus, ParticipantRef
-from .pages_sync import push_docs
+from .pages_sync import push_docs, write_live_server_file
 from .security import SuspicionTracker
 from .status_writer import get_status as get_status_writer
 from .tasks import spawn
+from .texts import TEXT
 from .timeutil import format_hm, now_ts
 
 log = logging.getLogger("hell.monitor")
@@ -68,6 +69,7 @@ class VoiceMonitor:
         self.alive_checks.bind(engine.event_uid)
         self.engine.hell_events.announcer = announcer
         self.engine.hell_events.alive_checks = self.alive_checks
+        self.engine._alive_checks = self.alive_checks
         self.engine.finale.announcer = announcer
         self.reports = FinalReportDM(bot, config, engine, announcer)
         self.continuation = ContinuationManager(bot, config, engine, announcer)
@@ -158,6 +160,36 @@ class VoiceMonitor:
                 continue
             humans.append(participant_ref(member))
         return humans, clankers
+
+    async def _dm_no_kick_rejoins(self, humans: Sequence[ParticipantRef]) -> None:
+        """DM the players who were kicked for saying No once they rejoin the VC.
+
+        Saying No is a free exit — they can come back whenever they want, and
+        the DM tells them so: "Psssst, you don't have to do the Alive Check."
+        Sent once per kick; a failing DM is only logged, never raised.
+        """
+        if not humans:
+            return
+        rejoined = self.alive_checks.pop_no_kick_rejoins({p.user_id for p in humans})
+        for uid in rejoined:
+            try:
+                user = self.bot.get_user(uid)
+                if user is None:
+                    user = await self.bot.fetch_user(uid)
+                if user is None:
+                    continue
+                await user.send(
+                    str(
+                        getattr(
+                            TEXT,
+                            "ALIVE_CHECK_REJOIN_DM",
+                            "Psssst, you don't have to do the Alive Check.",
+                        )
+                    )
+                )
+                log.info("Sent the rejoin DM to %d (kicked earlier for saying No)", uid)
+            except Exception:
+                log.warning("Could not DM %d after their rejoin", uid, exc_info=True)
 
     def _log_presence_changes(self, humans: Sequence[ParticipantRef]) -> None:
         """Emit a log line whenever somebody joins or leaves the target VC.
@@ -252,6 +284,7 @@ class VoiceMonitor:
             return
         humans, clankers = collected
         self._log_presence_changes(humans)
+        await self._dm_no_kick_rejoins(humans)
         if clankers:
             await self.kick_clankers(clankers)
         if self.grace_active:
@@ -270,7 +303,6 @@ class VoiceMonitor:
             self._pump_alive_check(now, humans)
             # Hell Events & Finale tick.  Hell 2 continuation has one finish
             # (the secret 320h reward), so the 159-160h finale never repeats.
-            await self.engine.hell_events.tick(now, humans)
             if not self.engine.is_continuation:
                 await self.engine.finale.tick(now, self.engine.elapsed(now), humans)
 
@@ -329,6 +361,16 @@ class VoiceMonitor:
             )
         except Exception:
             log.debug("Could not write status.json", exc_info=True)
+
+        # Publish where the *real* bot is listening so the static GitHub
+        # Pages dashboard can connect to it instead of showing the stale
+        # committed snapshot. Only meaningful while the web server is on.
+        public_url = getattr(self.config, "web_public_url", "")
+        if public_url and getattr(self.config, "web_port", 0) > 0:
+            try:
+                write_live_server_file(".", public_url)
+            except Exception:
+                log.debug("Could not write live-server.json", exc_info=True)
 
         if getattr(self.config, "github_pages_sync", False):
             try:
@@ -398,6 +440,7 @@ class VoiceMonitor:
             await self._final_progress(terminal=False)
         elif isinstance(event, MilestoneReached):
             await self.announcer.announce_milestone(event)
+            await self._announce_difficulty_escalation(event)
             self.sync_status()
         elif isinstance(event, EventFailed):
             await self.announcer.announce_failure(event)
@@ -414,6 +457,36 @@ class VoiceMonitor:
             await self._final_progress()
             self.reports.schedule()
             self.sync_status()
+
+    async def _announce_difficulty_escalation(self, event: MilestoneReached) -> None:
+        """Post the difficulty escalation that a milestone just unlocked.
+
+        Difficulty tiers unlock exactly at milestones (32h/64h/96h/128h), but
+        the milestone message only talks about the reward — so without this,
+        dead checks, gambling and the new Hell Events would silently appear.
+        The escalation announcement goes to the announcement channel, right
+        after the milestone itself. Late re-announcements (crash recovery)
+        never re-post it.
+        """
+        if event.late:
+            return
+        try:
+            from .difficulty import get_difficulty
+
+            override = self.engine.difficulty_override
+            before = get_difficulty(max(0.0, event.milestone.seconds - 60.0), override=override)
+            after = get_difficulty(event.milestone.seconds, override=override)
+            if after.level <= before.level:
+                return
+            log.info(
+                "Difficulty escalated to Level %d (%s) at the %dh milestone",
+                after.level,
+                after.name,
+                event.milestone.hours,
+            )
+            await self.announcer.announce_difficulty(after)
+        except Exception:
+            log.exception("Could not announce the difficulty escalation")
 
     async def _final_progress(self, *, terminal: bool = True) -> None:
         self._terminal_rendered = terminal

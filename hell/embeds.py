@@ -31,7 +31,7 @@ from .engine import (
     Snapshot,
 )
 from .finale import FinaleAnnouncement
-from .hellevents import HellEventEnded, HellEventStarted
+from .hellevents import HellEventEnded, HellEventStarted, is_secret_record
 from .leaderboard import format_entry, format_entry_live, top_n
 from .milestones import MILESTONES
 from .models import EventStatus, LeaderboardEntry, MilestoneRecord, ParticipantRef
@@ -335,7 +335,12 @@ class EmbedFactory:
                 next_milestone=snap.upcoming.hours,
                 time_to_next=format_hm(snap.time_to_next),
                 next_relative=(
-                    discord_ts((snap.start_ts or 0) + snap.upcoming.seconds, "R") if running else ""
+                    discord_ts(
+                        (snap.start_ts or 0) + snap.upcoming.seconds + getattr(snap, "paused_seconds", 0.0),
+                        "R",
+                    )
+                    if running
+                    else ""
                 ),
             )
         else:
@@ -408,8 +413,8 @@ class EmbedFactory:
             clanker_role=f"<@&{self.config.clanker_role_id}>",
             started_at=discord_ts(start_ts, "F"),
             started_relative=discord_ts(start_ts, "R"),
-            ends_at=discord_ts(start_ts + snap.total, "F"),
-            ends_relative=discord_ts(start_ts + snap.total, "R"),
+            ends_at=discord_ts(start_ts + snap.total + getattr(snap, "paused_seconds", 0.0), "F"),
+            ends_relative=discord_ts(start_ts + snap.total + getattr(snap, "paused_seconds", 0.0), "R"),
             participant_count=len(participants),
             total_hours=int(snap.total // 3600),
             grace_seconds=int(self.config.empty_vc_grace_seconds),
@@ -773,6 +778,28 @@ class EmbedFactory:
 
     def hell_event_start(self, event: HellEventStarted) -> discord.Embed:
         rec = event.record
+        secret = bool(getattr(event, "secret", False)) or is_secret_record(rec)
+        if secret:
+            # Say that *something* happened — but never what.
+            embed = discord.Embed(
+                title=str(
+                    getattr(TEXT, "HELL_EVENT_SECRET_TITLE", "🕯️ SECRET HELL EVENT — ???")
+                ),
+                description=event.announcement_text,
+                color=theme_color("RUNNING"),
+            )
+            embed.set_footer(
+                text=str(
+                    getattr(
+                        TEXT,
+                        "HELL_EVENT_SECRET_FOOTER",
+                        "Its nature stays hidden until it ends",
+                    )
+                )
+            )
+            self._brand(embed, timestamp=True)
+            return embed
+
         embed = discord.Embed(
             title=say(
                 getattr(TEXT, "HELL_EVENT_TITLE", "⚡ HELL EVENT — {name}"),
@@ -799,6 +826,24 @@ class EmbedFactory:
 
     def hell_event_end(self, event: HellEventEnded) -> discord.Embed:
         rec = event.record
+        if is_secret_record(rec):
+            # The veil lifts: this is the moment a secret event is identified.
+            embed = discord.Embed(
+                title=say(
+                    getattr(
+                        TEXT,
+                        "HELL_EVENT_SECRET_END_TITLE",
+                        "🕯️ SECRET HELL EVENT REVEALED — {name}",
+                    ),
+                    name=rec.name.upper(),
+                ),
+                description=event.announcement_text,
+                color=theme_color("RUNNING"),
+            )
+            embed.set_footer(text="The secret is out · Modifiers returned to normal · Keep surviving")
+            self._brand(embed, timestamp=True)
+            return embed
+
         embed = discord.Embed(
             title=f"⚡ HELL EVENT CONCLUDED — {rec.name.upper()}",
             description=event.announcement_text,
@@ -992,9 +1037,12 @@ class EmbedFactory:
             if d.gamble_enabled:
                 gamble_info = (
                     f"Active (`/hell gamble [hours]` / `!gamble [hours]`) — "
-                    f"Win: **+{d.gamble_win_multiplier:g}x** ({int(d.gamble_win_chance * 100)}% odds), "
+                    f"Win: **+{d.gamble_win_multiplier:g}x** "
+                    f"({int(d.gamble_win_chance * 100)}% / **{d.gamble_win_multiplier:g}x** at 15m; bigger bets = worse odds, better payout; rare jackpot **+1x** extra), "
                     f"Lose: **-1.0x** + {d.gamble_loss_mute_seconds // 60}m mute | "
-                    f"Limits: max **{d.gamble_max_bet_hours:g}h** bet, max **{d.gamble_hourly_limit}/hour**"
+                    f"Limits: max **{d.gamble_max_bet_hours:g}h** bet, "
+                    f"**{d.gamble_hourly_limit}** fast bets/hour then a "
+                    f"**{int(d.gamble_overflow_cooldown_seconds // 60)}m** extra timer"
                 )
             embed.add_field(
                 name=f"Level {d.level}: {d.name} — {unlocked}{active_marker}",
@@ -1018,9 +1066,12 @@ class EmbedFactory:
         if diff.gamble_enabled:
             gamble_info = (
                 f"Active (`/hell gamble [hours]` / `!gamble [hours]`) — "
-                f"Win: **+{diff.gamble_win_multiplier:g}x** ({int(diff.gamble_win_chance * 100)}% odds), "
+                f"Win: **+{diff.gamble_win_multiplier:g}x** "
+                f"({int(diff.gamble_win_chance * 100)}% / **{diff.gamble_win_multiplier:g}x** at 15m; bigger bets = worse odds, better payout; rare jackpot **+1x** extra), "
                 f"Lose: **-1.0x** + {diff.gamble_loss_mute_seconds // 60}m mute | "
-                f"Limits: max **{diff.gamble_max_bet_hours:g}h** bet, max **{diff.gamble_hourly_limit}/hour**"
+                f"Limits: max **{diff.gamble_max_bet_hours:g}h** bet, "
+                f"**{diff.gamble_hourly_limit}** fast bets/hour then a "
+                f"**{int(diff.gamble_overflow_cooldown_seconds // 60)}m** extra timer"
             )
 
         embed = discord.Embed(

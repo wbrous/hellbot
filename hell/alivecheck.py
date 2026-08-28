@@ -17,10 +17,12 @@ what makes the whole flow unit-testable.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import uuid
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -45,10 +47,23 @@ YES_REPLIES = frozenset(
     }
 )
 # Ways to say No (results in an immediate kick + "Alright then").
+# Single words match per-word; multi-word entries match the whole reply.
 NO_REPLIES = frozenset(
     {
         "no", "nope", "n", "no thanks", "no thank you",
         "negative", "not me",
+        # common English no-synonyms
+        "nah", "nahh", "nay", "nop", "never", "false", "denied",
+        "hell no", "no way", "not at all", "not today", "not alive", "not here",
+        "absolutely not", "definitely not", "certainly not", "of course not",
+        "i refuse", "nope nope",
+        # Spanish no-synonyms
+        "jamas", "nunca", "negativo",
+        "para nada", "claro que no", "por supuesto que no",
+        "de ninguna manera", "en absoluto",
+        # negated yes-words — without these, "not sure" would match the
+        # word-level YES check ("sure") and count as alive
+        "not sure", "not really", "not okay", "not ok", "not correct",
     }
 )
 
@@ -220,6 +235,9 @@ class AliveCheckManager:
         self._event_uid: Optional[str] = None
         self._active_tasks: set[Any] = set()
         self._resolve_lock = asyncio.Lock()
+        # Players kicked for saying "No" — they get a friendly DM when they
+        # rejoin the VC (they don't have to answer the roll call to return).
+        self._no_kicked: set[int] = set()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -227,11 +245,13 @@ class AliveCheckManager:
         """Attach to an event, restoring any pending check from the database."""
         self._event_uid = event_uid
         self.pending = None
+        self._no_kicked = set()
         if not event_uid:
             return
         row = self.store.load_alive_check(event_uid)
         if row:
             self.pending = PendingCheck.from_row(row)
+        self._load_no_kicked()
         if self.store.get_next_alive_check(event_uid) is None:
             self.schedule_next(now if now is not None else now_ts())
 
@@ -243,6 +263,47 @@ class AliveCheckManager:
     def reset(self) -> None:
         self.pending = None
         self._event_uid = None
+        self._no_kicked = set()
+
+    # ------------------------------------------------------ no-kick rejoin DMs
+
+    def note_no_kick(self, user_id: int) -> None:
+        """Remember a player kicked for saying No — they get a DM on rejoin."""
+        if user_id in self._no_kicked:
+            return
+        self._no_kicked.add(user_id)
+        self._save_no_kicked()
+
+    def pop_no_kick_rejoins(self, present_ids: AbstractSet[int]) -> list[int]:
+        """Consume the no-kicked players that are (back) in the VC right now.
+
+        Returns the user IDs to DM and removes them from the tracker, so the
+        message is sent once per kick — not on every monitor tick.
+        """
+        rejoined = sorted(uid for uid in self._no_kicked if uid in present_ids)
+        if rejoined:
+            self._no_kicked.difference_update(rejoined)
+            self._save_no_kicked()
+        return rejoined
+
+    def _no_kicked_key(self) -> str:
+        return f"no_kicked:{self._event_uid or ''}"
+
+    def _save_no_kicked(self) -> None:
+        if not self._event_uid:
+            return
+        try:
+            self.store.set_meta(self._no_kicked_key(), json.dumps(sorted(self._no_kicked)))
+        except Exception:  # pragma: no cover - never break a kick on a meta write
+            log.warning("Could not persist the no-kick tracker", exc_info=True)
+
+    def _load_no_kicked(self) -> None:
+        try:
+            raw = self.store.get_meta(self._no_kicked_key())
+            self._no_kicked = {int(u) for u in json.loads(raw)} if raw else set()
+        except Exception:  # pragma: no cover - corrupt meta never breaks binding
+            log.warning("Could not read the no-kick tracker", exc_info=True)
+            self._no_kicked = set()
 
     # ------------------------------------------------------------ difficulties
 
@@ -262,10 +323,12 @@ class AliveCheckManager:
 
     def pick_delay(self, now: Optional[float] = None) -> float:
         """A random delay scaled by current difficulty (1-6h, 1-5h, 1-4h, 1-3h, 1-2h)."""
-        # If Inferno Hell Event is active, checks occur at an accelerated 3–6 minute interval
+        # While a check storm is active (Inferno 3–6 min, Ember Rain 8–15 min)
+        # roll calls follow the storm's window instead of the difficulty cadence.
         if self.engine is not None and getattr(self.engine, "hell_events", None):
-            if self.engine.hell_events.is_inferno_active(now):
-                return self.rng.uniform(180.0, 360.0)
+            window = self.engine.hell_events.check_storm_window(now)
+            if window is not None:
+                return self.rng.uniform(*window)
 
         diff = self.current_difficulty(now)
         min_hours = min(self.config.alive_check_min_hours, diff.min_check_hours)
@@ -281,6 +344,74 @@ class AliveCheckManager:
             self.store.set_next_alive_check(self._event_uid, when)
         log.info("Next roll call in %s (at %.0f)", format_hm(delay), when)
         return when
+
+    def shift_schedule(self, duration: float) -> None:
+        """Move the next (and any pending) roll call forward by ``duration`` seconds.
+
+        Used when a failed/paused run is resumed so Discord timestamps and the
+        due clock stay aligned with wall time instead of firing immediately.
+        """
+        if not self._event_uid or duration <= 0:
+            return
+        if self.pending is not None:
+            self.pending.started_ts += duration
+            self.pending.deadline_ts += duration
+            self.store.save_alive_check(self._event_uid, self.pending.to_row())
+        next_ts = self.next_check_ts()
+        if next_ts is not None:
+            self.store.set_next_alive_check(self._event_uid, next_ts + duration)
+            log.info("Shifted next roll call forward by %.1fs", duration)
+        else:
+            self.schedule_next(now_ts())
+
+    def postpone_next(self, seconds: float, now: Optional[float] = None) -> Optional[float]:
+        """Push the next scheduled roll call back by ``seconds``.
+
+        Used by the Golden Hour Hell Event.  Returns the new due timestamp, or
+        ``None`` when nothing can be postponed right now: a roll call is already
+        pending, roll calls are disabled, or the manager is not bound to an
+        event.  Never touches a check that is currently running.
+        """
+        if not self._event_uid or not self.enabled or self.pending is not None or seconds <= 0:
+            return None
+        cur_now = now if now is not None else now_ts()
+        current = self.next_check_ts()
+        if current is None:
+            self.schedule_next(cur_now)
+            current = self.next_check_ts() or cur_now
+        new_ts = max(current, cur_now) + seconds
+        self.store.set_next_alive_check(self._event_uid, new_ts)
+        log.info("Next roll call postponed by %s (new due in %.0fs)", format_hm(seconds), new_ts - cur_now)
+        return new_ts
+
+    def accelerate_next(
+        self, min_seconds: float, max_seconds: float, now: Optional[float] = None
+    ) -> Optional[float]:
+        """Pull the next scheduled roll call INTO ``[min, max]`` seconds from now.
+
+        Used by the Inferno Hell Event: an already-scheduled roll call must not
+        calmly wait hours away while Hell is burning — checks become frequent
+        the moment Inferno starts, not only after the next check happens to
+        fire.  A roll call that is already due even sooner is left alone.
+        Returns the new due timestamp, or ``None`` when nothing can be moved
+        (a check is pending, checks are off, or the manager is not bound).
+        """
+        if not self._event_uid or not self.enabled or self.pending is not None:
+            return None
+        if max_seconds < min_seconds:
+            min_seconds, max_seconds = max_seconds, min_seconds
+        cur_now = now if now is not None else now_ts()
+        new_ts = cur_now + self.rng.uniform(min_seconds, max_seconds)
+        current = self.next_check_ts()
+        if current is not None and current <= new_ts:
+            return current  # already sooner than the accelerated window
+        self.store.set_next_alive_check(self._event_uid, new_ts)
+        log.info(
+            "Next roll call accelerated to %.0fs from now (was %s)",
+            new_ts - cur_now,
+            "not scheduled" if current is None else f"{max(0.0, current - cur_now):.0f}s away",
+        )
+        return new_ts
 
     def next_check_ts(self) -> Optional[float]:
         if not self._event_uid:
@@ -478,6 +609,7 @@ class AliveCheckManager:
             log.exception("Could not disconnect %s after a No reply", user_id)
         if kicked:
             check.declined_kicked.add(user_id)
+            self.note_no_kick(user_id)
             self.store.save_alive_check(self._event_uid or "", check.to_row())
         await self.io.send_result(str(getattr(TEXT, "ALIVE_CHECK_NO_REPLY", "Alright then")))
 
@@ -601,6 +733,7 @@ class AliveCheckManager:
                     for uid in sorted(to_kick):
                         if uid in check.declined and uid in kicked_ids:
                             check.declined_kicked.add(uid)
+                            self.note_no_kick(uid)
                 if to_kick and not kicked_ids and not cancelled:
                     log.error(
                         "Alive check %s: %d user(s) ignored it but none could be disconnected",

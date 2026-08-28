@@ -20,6 +20,7 @@ from hell.cog import HellCommands
 from hell.milestones import TOTAL_SECONDS
 from hell.models import EventStatus
 from hell.monitor import VoiceMonitor
+from hell.texts import TEXT
 from hell.timeutil import now_ts
 from hell.ui import DMsClosed, NotAHost, NotOperator
 from tests.conftest import GRACE, T0, obs, start
@@ -82,10 +83,11 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, client, user, guild_id=1):
+    def __init__(self, client, user, guild_id=1, channel_id=None):
         self.client = client
         self.user = user
         self.guild = type("G", (), {"id": guild_id})()
+        self.channel_id = channel_id
         self.response = FakeResponse()
         self.followup = FakeFollowup()
 
@@ -223,6 +225,64 @@ def test_dm_operator_only_check_rules(wired, config):
     dm_op = FakeInteraction(bot, FakeAuthor(uid=config.log_dm_user_id))
     dm_op.guild = None
     assert run(predicate(dm_op)) is True
+
+
+def test_dm_host_only_check_rules(wired, config, host, monkeypatch):
+    cog, bot, _text, _voice = wired
+    predicate = cog.alivecheck.checks[0]
+
+    # In a guild -> DMsClosed: the alive check lever lives in DMs only.
+    guild_interaction = FakeInteraction(bot, _member(host))
+    with pytest.raises(DMsClosed):
+        run(predicate(guild_interaction))
+
+    # In DM, the operator passes without any role lookup.
+    dm_op = FakeInteraction(bot, FakeAuthor(uid=config.log_dm_user_id))
+    dm_op.guild = None
+    assert run(predicate(dm_op)) is True
+
+    class FakeGuild:
+        def __init__(self, members):
+            self._members = {m.id: m for m in members}
+
+        def get_member(self, uid):
+            return self._members.get(uid)
+
+        async def fetch_member(self, uid):
+            member = self._members.get(uid)
+            if member is None:
+                from unittest.mock import MagicMock
+
+                raise discord.NotFound(MagicMock(status=404), "unknown member")
+            return member
+
+    member = _member(host)
+    monkeypatch.setattr(bot, "get_guild", lambda _gid: FakeGuild([member]))
+
+    # In DM, a gamenight host (role resolved via the configured guild) passes.
+    dm_host = FakeInteraction(bot, FakeAuthor(uid=host.id))
+    dm_host.guild = None
+    assert run(predicate(dm_host)) is True
+
+    # In DM, anyone without the host role is rejected.
+    dm_outsider = FakeInteraction(bot, FakeAuthor(uid=9999))
+    dm_outsider.guild = None
+    with pytest.raises(NotAHost):
+        run(predicate(dm_outsider))
+
+    # No guild resolvable at all -> still NotAHost (never a crash).
+    monkeypatch.setattr(bot, "get_guild", lambda _gid: None)
+
+    async def no_guild(_gid):
+        from unittest.mock import MagicMock
+
+        raise discord.HTTPException(MagicMock(status=500), "down")
+
+    monkeypatch.setattr(bot, "fetch_guild", no_guild)
+    stranded = FakeInteraction(bot, _member(host))
+    stranded.guild = None
+    with pytest.raises(NotAHost):
+        run(predicate(stranded))
 
 
 def test_restart_command_exits_with_restart_code(wired, config):
@@ -380,6 +440,70 @@ def test_leaderboard_says_when_it_is_frozen(wired, host, engine):
     call(cog, "leaderboard", interaction)
 
     assert "frozen" in interaction.text().lower()
+
+
+# ------------------------------ status & leaderboard in the VC text chat
+
+
+def test_status_in_the_vc_chat_replies_with_the_pinned_link(wired, host, engine):
+    """`/hell status` in the VC text chat links the pinned card, no embed."""
+    cog, bot, _text, voice = wired
+    start(engine, now_ts() - 3600, 1, 2)
+    interaction = FakeInteraction(bot, host, channel_id=voice.id)
+
+    call(cog, "status", interaction)
+
+    assert interaction.followup.sent == [{"content": TEXT.CMD_STATUS_VC_LINK}]
+    assert interaction.text() == TEXT.CMD_STATUS_VC_LINK
+    assert "discord.com/channels/" in interaction.text()
+
+
+def test_leaderboard_in_the_vc_chat_replies_with_the_pinned_link(wired, host, engine):
+    """`/hell leaderboard` in the VC text chat links the pinned board — and
+    does NOT spawn the auto-updating copy there."""
+    cog, bot, _text, voice = wired
+    start(engine, T0, 1, 2)
+    for i in range(1, 61):
+        engine.tick(obs(T0 + i, 1, 2))
+    interaction = FakeInteraction(bot, host, channel_id=voice.id)
+
+    call(cog, "leaderboard", interaction)
+
+    assert interaction.followup.sent == [{"content": TEXT.CMD_LEADERBOARD_VC_LINK}]
+    assert cog._leaderboard_task is None
+    assert cog._leaderboard_message is None
+
+
+def test_status_and_leaderboard_elsewhere_still_show_the_embeds(wired, host, engine):
+    """Outside the VC text chat the commands keep their normal behaviour."""
+    cog, bot, text, _voice = wired
+    start(engine, now_ts() - 3600, 1, 2)
+    for i in range(1, 61):
+        engine.tick(obs(T0 + i, 1, 2))
+
+    status = FakeInteraction(bot, host, channel_id=text.id)
+    call(cog, "status", status)
+    assert any("embed" in m for m in status.messages)
+    assert "discord.com/channels/" not in status.text()
+
+    board = FakeInteraction(bot, host, channel_id=text.id)
+    call(cog, "leaderboard", board)
+    assert any("embeds" in m for m in board.messages)
+    assert "🥇" in board.text()
+
+
+def test_status_link_in_vc_chat_respects_the_alive_check_channel_override(wired, host, config):
+    """With ALIVE_CHECK_CHANNEL_ID set, that channel is the 'VC chat', not the VC."""
+    cog, bot, _text, voice = wired
+    config.alive_check_channel_id = 424242
+
+    in_override = FakeInteraction(bot, host, channel_id=424242)
+    call(cog, "status", in_override)
+    assert in_override.text() == TEXT.CMD_STATUS_VC_LINK
+
+    in_vc_itself = FakeInteraction(bot, host, channel_id=voice.id)
+    call(cog, "status", in_vc_itself)
+    assert any("embed" in m for m in in_vc_itself.messages)
 
 
 # -------------------------------------------------------- /hell milestones

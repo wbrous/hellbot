@@ -29,7 +29,16 @@ empties and nobody returns within the grace period, the run is dead — permanen
   at least one valid human, or the start is refused
 * Bots never count · `@clanker` is kicked on sight · AFK still counts
 * **15-second grace period** when the VC empties, with a no-ping warning
-* **Random alive checks** every 1–6 h: reply `Yes` in 5 minutes or get disconnected
+* **Random alive checks** every 1–6 h: reply `Yes` in 5 minutes or get disconnected. They are
+  **unpredictable** — the moment is drawn fresh (uniformly) inside the current difficulty's range,
+  and the next one is never shown to players. Hell Events bend the schedule in real time:
+  **Inferno** pulls the next roll call into a 3–6 minute window, **Golden Hour** postpones it, and
+  **The Culling** triggers one immediately. Saying `No` (or any of its synonyms) is a free exit —
+  you are disconnected, keep all your time, and get a DM when you rejoin telling you that you
+  don't have to answer anything to come back
+* **Random Hell Events** every 30m–3h — good and bad (bonuses, penalties, accelerated checks,
+  hidden info…), announced **only in the VC text chat** with a ping; about
+  **1 in 4 is secret**: it says *something* happened and only reveals what when it ends
 * A **personal stat card by DM** for every contestant when the run ends
 * Hosts can post **colored embeds** with `/hell broadcast` (`info`, `warning`, `error`, …) to the
   announcement channel or the VC text chat
@@ -47,6 +56,16 @@ empties and nobody returns within the grace period, the run is dead — permanen
   outage is credited back to whoever never left the VC
 * **Live log stream** DM'd to the operator: joins, leaves, kicks, milestones, errors
   (`/hell logs tail` shows recent lines in-channel when DMs are off)
+* **Live web dashboard** on `WEB_PORT` (default `8080`, `0` disables): the public page `/` and the
+  operator page `/dev`. Browsers connect however they can: over **WebSocket** (`/ws`) they get the
+  current snapshot **instantly on connect** and a fresh one every 5 s; if WebSockets are blocked
+  (some proxies), the page polls **`/status.json`, which is served live from the bot's current
+  state** — never the stale static file. `/health` reports connected clients and snapshot age.
+  The same pages also work statically on GitHub Pages — and there they connect to the **real bot**:
+  the page discovers the bot's address via `?server=`, the 🔌 button (saved in the browser) or the
+  `docs/live-server.json` pointer that the bot publishes when `WEB_PUBLIC_URL` is set (needs
+  `GITHUB_PAGES_SYNC` to reach GitHub). CORS is open on the bot's endpoints so cross-origin reads
+  work; only if no live bot answers does the page fall back to the synced static `status.json`
 * **Dangerous commands need the operator's approval**: `/hell stop`, `/hell reset` and resuming a failed run with `/hell resume` only run
   after a one-time code DM'd to the operator is entered with `/hell approve`
 * **`/hell pause` freezes the run** (global + per-user timers) so a bug can be fixed without the
@@ -200,9 +219,9 @@ in the log, and in the launcher's Dashboard.
 | Command | Who | What |
 |---|---|---|
 | `/hell start` | `@gamenight host` | Starts the event: status → `RUNNING`, records the absolute start timestamp, starts the 160 h timer, begins VC monitoring + per-user tracking, posts the start announcement. Rejected if one is already running or the VC is empty (hard requirement). |
-| `/hell status` | everyone | Status, elapsed, remaining, % complete, progress bar, live VC headcount, current + next milestone, and the milestones already reached. |
-| `/hell leaderboard` | everyone | Current (or frozen final) leaderboard: Top 3 on the podium, everyone else below. |
-| `/hell alivecheck` | `@gamenight host` | Runs a roll call immediately instead of waiting for the random timer. |
+| `/hell status` | everyone | Status, elapsed, remaining, % complete, progress bar, live VC headcount, current + next milestone, and the milestones already reached. Used **in the VC text chat** it instead replies with a link to the pinned live status card (Discord renders the preview). |
+| `/hell leaderboard` | everyone | Real Timer (VC time) or **Gamble Time** wallet rankings (`board:`). Used **in the VC text chat**, Real Timer replies with a link to the pinned leaderboard. |
+| `/hell alivecheck` | DM only: bot operator or `@gamenight host` | Runs a roll call immediately instead of waiting for the random timer. Usable **only in a DM to the bot**, never in a server channel. |
 | `/hell reloadmessages` | `@gamenight host` | Re-read `Announcements.py` so edited wording applies immediately. |
 | `/hell doctor` | `@gamenight host` | Self-check: preflight results, live state, background tasks and the (redacted) configuration. |
 | `/hell logs` | `@gamenight host` | Control the live log stream: `status`, `on`, `off`, `test`, `flush`, and the minimum severity. |
@@ -214,7 +233,8 @@ in the log, and in the launcher's Dashboard.
 | `/hell difficulty` | everyone / `@gamenight host` | Show the 5 difficulty tiers and current level; `action: set` (host only, `0`-`4` or `auto`) overrides it; `action: announce` (host only) posts it to the announcement channel. |
 | `/hell broadcast` | `@gamenight host` | Post the host's message as a colored embed — `level: info/warning/error/…`, `target: announcements` or `vc`, no plain text outside the embed. |
 | `/hell hellevents` | everyone / `@gamenight host` | View active Hell Event, rules, or trigger an event (`action: trigger`, `@gamenight host` only). |
-| `/hell gamble` | everyone | Gamble your leaderboard timer (Difficulty 3+): win bonus time or risk losing personal time + 1 minute server mute. Supports optional `[hours]` bet. |
+| `/hell gamble` | everyone | Difficulty 3+: bet **Real Timer** (hourly quota + overflow timer) or **Gamble Time** (no rate limits). Bets snap to 15m chips; you cannot bet all of your time (`gamble_max_bet_hours`). Lose = stake + mute. |
+| `/hell adjtime` | `@gamenight host` | Add or remove hours on a member's **Real Timer** or **Gamble Time** (`hours` may be negative). |
 | `/hell stop` | `@gamenight host` | **Two-step, operator-approved.** The bot DMs a one-time code to the operator's DMs, then the host runs `/hell approve` with it → event marked **CANCELLED** (explicitly *not* FAILED), leaderboard frozen. |
 | `/hell reset` | `@gamenight host` | **Two-step, operator-approved.** The bot DMs a one-time code to the operator's DMs, then the host runs `/hell approve` with it → all event data wiped for a fresh run. |
 | `/hell approve` | `@gamenight host` | Enter the 6-character code DM'd to the operator to confirm the pending `/hell stop`, `/hell reset` or resuming a failed run. Codes expire after 5 minutes and work exactly once; a new request invalidates the previous code. |
@@ -229,8 +249,8 @@ users without 250 notifications — while the `@everyone` ping stays in the mess
 
 ### Server & Direct Message (DM) Commands
 
-- **Server commands:** Run exclusively via slash commands (`/hell <command>`).
-- **Direct Message (DM) commands:** Run exclusively in Direct Messages with the `!` prefix (e.g. `!status`, `!leaderboard`, `!mystats`, `!help`, `!restart`, `!doctor`, `!hell status`, etc.). Prefix `!` commands are strictly restricted to DMs and will not run in server channels. DM commands enforce the same host/operator authorization checks.
+- **Server commands:** Run via slash commands (`/hell <command>`) **or** with the `!` prefix directly in server channels (e.g. `!status`, `!leaderboard`, `!gamble 0.5`, `!hell status`). `!status` and `!leaderboard` used in the VC text chat reply with the pinned-card links, exactly like their slash twins.
+- **Direct Message (DM) commands:** The same `!` prefix commands also run in DMs with the bot (e.g. `!status`, `!help`, `!restart`, `!doctor`, `!hell status`). Prefix `!` commands enforce the same host/operator authorization checks everywhere they run.
 
 ---
 
@@ -255,6 +275,9 @@ cancellation, completion, leaderboard, alive checks, stat cards, command replies
 each block lists the `{placeholders}` it accepts.
 
 * **Edit the text between the quotes**, keep the `{placeholders}` you want, save.
+* `CMD_STATUS_VC_LINK` and `CMD_LEADERBOARD_VC_LINK` (section 12) are the message links the bot
+  posts for `/hell status` and `/hell leaderboard` **in the VC text chat** — paste your own
+  pinned-message links there.
 * Run **`/hell reloadmessages`** (host only) and the new wording is live — no restart, no risk to a
   running 160-hour event.
 * If your edit has a syntax error or a missing name, the bot **keeps the previously loaded text**
@@ -426,11 +449,30 @@ Difficulties make the challenge harder as the event progresses, expanding at eve
 
 Intervals between events occur randomly between **30 minutes and 3 hours** (scaling more frequently at higher difficulty tiers). All Hell Events persist in SQLite to survive bot restarts.
 
-1. **Double Time** (5 minutes): All valid humans in the VC receive **2× personal leaderboard time** while active. The global 160h clock is not accelerated.
-2. **Blood Pact** (Instant): Everyone currently in the VC at the moment of the event receives an instant personal survival time bonus (**+5 minutes**, scaling up to +10m on Difficulty 4).
-3. **Inferno** (10 minutes): Alive/Dead checks occur at a significantly accelerated frequency (every 3–6 minutes) while preserving normal response windows.
-4. **Blindness** (10 minutes): Temporarily hides remaining time and upcoming milestone from the progress card (`[HIDDEN BY BLINDNESS]`) while keeping the main elapsed timer and event status visible.
-5. **Hell Jackpot** (5 minutes): Temporarily increases gambling win multipliers (+1.0x bonus multiplier).
+Every Hell Event announcement is posted in the **VC text chat only** — never in the announcement channel — pinging everyone the event applies to, so the people actually sitting in Hell never miss one.
+
+**Good events**
+
+1. **Double Time** (5 minutes): All valid humans in the VC receive **2× personal leaderboard time** while active (2.5× on Difficulty 4). The global 160h clock is not accelerated.
+2. **Overdrive** (5 minutes): A milder boost — **1.5× personal leaderboard time** while active (1.75× on Difficulty 4). Unlocks at Difficulty 1.
+3. **Blood Pact** (Instant): Everyone currently in the VC at the moment of the event receives an instant personal survival time bonus (**+5 minutes**, scaling up to +10m on Difficulty 4).
+4. **Hell Jackpot** (5 minutes): Temporarily increases gambling win multipliers (+1.0x bonus multiplier).
+5. **Fortune's Wheel** (5 minutes): A milder gambling boost (+0.75x bonus multiplier, +1.0x on Difficulty 4). Unlocks at Difficulty 3 alongside gambling itself.
+6. **Golden Hour** (Instant): Hell looks away — the next roll call is **postponed by 30–50 minutes** (more relief the higher the difficulty). Skipped honestly if a roll call is already running.
+7. **Soul Cache** (Instant): A hidden cache of stolen time surfaces for **one random person** in the VC: **+10 minutes** of personal survival time, scaling up to +20m on Difficulty 4.
+
+**Bad events**
+
+8. **Inferno** (10 minutes): Alive/Dead checks occur at a significantly accelerated frequency (every 3–6 minutes) while preserving normal response windows.
+9. **Ember Rain** (10 minutes): A milder check storm — roll calls fall every **8–15 minutes** while it lasts. Unlocks at Difficulty 2.
+10. **Blindness** (10 minutes): Temporarily hides remaining time and upcoming milestone from the progress card (`[HIDDEN BY BLINDNESS]`) while keeping the main elapsed timer and event status visible.
+11. **Time Vortex** (5 minutes): Personal leaderboard time runs at **half speed** for everyone in the VC (a quarter on Difficulty 4). The global clock is not touched.
+12. **Blood Debt** (Instant): The tax collectors of Hell come knocking — everyone in the VC is charged **-2 minutes** of personal survival time (scaling to -5m on Difficulty 4; never below zero).
+13. **The Culling** (Instant): An **immediate roll call** is triggered — reply `Yes` in time or be disconnected from the VC. Skipped if a roll call is already running.
+
+**Secret events** 🕯️
+
+Roughly **one in four** randomly scheduled events is a **secret event**: the announcement only says that *something* has changed deep within Hell — the event's name, duration and effect all stay hidden until the event ends and the veil is lifted (`THE SECRET EVENT IS REVEALED: …`). Instant events can never be secret (they are obvious the moment they happen), so secrets are always drawn from the timed ones. While a secret event runs, `/hell hellevents` shows it only as `??? (Secret Event)`. Hosts can force one with `/hell hellevents` → `trigger` → `Secret`.
 
 ### The 160-Hour Finale
 
@@ -459,6 +501,10 @@ You keep all your leaderboard time and can rejoin immediately.
 * Everyone **currently in the VC** is pinged — bots and `@clanker` users are never included.
 * Each has **5 minutes** to reply `Yes` in that channel (case-insensitive by default; set
   `ALIVE_CHECK_STRICT=true` to demand the exact string). Counted answers get a ✅ reaction.
+* Replying **No** — or any of its synonyms (`nope`, `nah`, `never`, `hell no`, `no way`, `nop`,
+  `not sure`, `para nada`, `nunca`, …) — is an **instant but painless exit**: you are disconnected, keep all
+  your leaderboard time, and when you rejoin the VC the bot DMs you
+  *"Psssst, you don't have to do the Alive Check."* so you know coming back needs no answer.
 * Whoever stays silent is **disconnected from the VC**. Their accumulated leaderboard time is
   **not** touched and they may **rejoin immediately** — tracking resumes as normal.
 * A disconnect never fails the event by itself; the run only ends if the VC is left with no valid
@@ -469,7 +515,11 @@ You keep all your leaderboard time and can rejoin immediately.
   answers posted while it was offline; if the 5 minutes expired during the downtime the check is
   **cancelled** — nobody is punished for the bot being away.
 * The next check time is never announced (that would defeat the point); `/hell status` only says
-  that checks happen randomly every 1–6 h.
+  that checks happen randomly every 1–6 h. The moment is drawn uniformly inside the current
+  difficulty's range, so a check can land on **any second of that window** — and Hell Events
+  reshape the schedule **while it is pending**: **Inferno** pulls the next roll call forward into
+  its 3–6 minute window the instant it starts, **Golden Hour** postpones the next roll call, and
+  **The Culling** fires one immediately.
 
 ### Leaderboard
 

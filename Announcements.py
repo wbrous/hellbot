@@ -277,7 +277,7 @@ FAILURE_TITLE = "💀 WELCOME TO HELL — CHALLENGE FAILED"
 FAILURE_DESCRIPTION = (
     "{vc} was **completely empty of valid participants** for the entire grace period, "
     "so nobody came back in time.\n"
-    "The timer has stopped **permanently** and the run cannot resume."
+    "The timer has stopped. A host can resume this run with `/hell resume` (operator approval required)."
 )
 FAILURE_SURVIVED_FIELD = "⏱️ Survived"
 FAILURE_SURVIVED_TEXT = "**{survived}** of 160h"
@@ -377,6 +377,7 @@ ALIVE_CHECK_RESULT_KICKED_NOTE = (
 ALIVE_CHECK_RESULT_NOBODY_KICKED = "❌ Disconnected: **nobody** — everyone answered in time."
 ALIVE_CHECK_RESULT_LEFT_EARLY = "↩️ Already out of the VC: {left_early}"
 ALIVE_CHECK_NO_REPLY = "Alright then"
+ALIVE_CHECK_REJOIN_DM = "Psssst, you don't have to do the Alive Check."
 ALIVE_CHECK_CANCELLED = (
     "🚨 **Alive check cancelled** — {reason}. Nobody was disconnected."
 )
@@ -478,6 +479,17 @@ LOG_ALERT_BODY = (
 #  {vc} {announce_channel} {host_role} {elapsed} {total} {status} {started_at}
 #  {minutes} {check_channel} {previous_status}
 
+# `/hell status` and `/hell leaderboard` (and their `!` twins) reply with these
+# links when they are used in the VC text chat: Discord renders the linked
+# message as a preview, so the pinned live cards are shown without dumping a
+# second copy into the VC.  Point them at the pinned messages of your server.
+CMD_STATUS_VC_LINK = (
+    "https://discord.com/channels/1539201707026939934/1539784904630468699/1541386927113117751"
+)
+CMD_LEADERBOARD_VC_LINK = (
+    "https://discord.com/channels/1539201707026939934/1539784904630468699/1541807282155954247"
+)
+
 CMD_ALREADY_RUNNING = (
     "❌ **Welcome to Hell is already RUNNING** — {elapsed} on the clock. "
     "Use `/hell status`, or `/hell stop` to cancel it first."
@@ -576,6 +588,11 @@ HELL_EVENT_DOUBLE_TIME_START = (
     "For the next **{duration} minutes**, your personal leaderboard time is being multiplied by **{multiplier}x**."
 )
 HELL_EVENT_DOUBLE_TIME_END = "🔥 **DOUBLE TIME HAS ENDED**\n\nHell is no longer feeling generous."
+HELL_EVENT_OVERDRIVE_START = (
+    "⚡ **HELL EVENT — OVERDRIVE**\n\n"
+    "For the next **{duration} minutes**, your personal leaderboard time is being multiplied by **{multiplier}x**."
+)
+HELL_EVENT_OVERDRIVE_END = "⚡ **OVERDRIVE HAS ENDED**\n\nThe surge fades — time flows normally again."
 HELL_EVENT_BLOOD_PACT_START = (
     "🩸 **HELL EVENT — BLOOD PACT**\n\n"
     "Everyone currently in Hell ({count} participants) has been granted **+{bonus}** of personal survival time."
@@ -586,6 +603,14 @@ HELL_EVENT_INFERNO_START = (
     "Alive and Dead Checks will occur more frequently for the next **{duration} minutes**."
 )
 HELL_EVENT_INFERNO_END = "🔥 **INFERNO HAS SUBSIDED**\n\nThe heat recedes. Check frequency has returned to normal."
+HELL_EVENT_EMBER_RAIN_START = (
+    "🌧️ **HELL EVENT — EMBER RAIN**\n\n"
+    "Burning embers drift down from above.\n"
+    "Roll calls will fall every **8–15 minutes** for the next **{duration} minutes**."
+)
+HELL_EVENT_EMBER_RAIN_END = (
+    "🌧️ **EMBER RAIN HAS PASSED**\n\nThe embers die out. Roll call frequency has returned to normal."
+)
 HELL_EVENT_BLINDNESS_START = (
     "👁️ **HELL EVENT — BLINDNESS**\n\n"
     "For the next **{duration} minutes**, Hell will hide your remaining time."
@@ -596,9 +621,62 @@ HELL_EVENT_JACKPOT_START = (
     "For the next **{duration} minutes**, gambling rewards are increased."
 )
 HELL_EVENT_JACKPOT_END = "🎰 **JACKPOT HAS ENDED**\n\nGambling rewards have returned to normal."
+HELL_EVENT_FORTUNES_WHEEL_START = (
+    "🎡 **HELL EVENT — FORTUNE'S WHEEL**\n\n"
+    "The wheel is spinning in your favour. For the next **{duration} minutes**, gambling rewards are increased."
+)
+HELL_EVENT_FORTUNES_WHEEL_END = "🎡 **FORTUNE'S WHEEL HAS STOPPED**\n\nGambling rewards have returned to normal."
+HELL_EVENT_TIME_VORTEX_START = (
+    "🌀 **HELL EVENT — TIME VORTEX**\n\n"
+    "For the next **{duration} minutes**, your personal leaderboard time is running at **{multiplier}x speed**.\n"
+    "Every second in Hell now counts for less."
+)
+HELL_EVENT_TIME_VORTEX_END = "🌀 **TIME VORTEX HAS CLOSED**\n\nTime flows normally again. Every second counts once more."
+HELL_EVENT_GOLDEN_HOUR_START = (
+    "😇 **HELL EVENT — GOLDEN HOUR**\n\n"
+    "Hell looks away for a moment. Your next roll call has been postponed by **{delay}**.\n"
+    "Breathe. You have earned it."
+)
+HELL_EVENT_SOUL_CACHE_START = (
+    "💎 **HELL EVENT — SOUL CACHE**\n\n"
+    "A hidden cache of stolen time has surfaced — and **{who}** found it first.\n"
+    "**+{bonus}** of personal survival time, on the house."
+)
+HELL_EVENT_BLOOD_DEBT_START = (
+    "📉 **HELL EVENT — BLOOD DEBT**\n\n"
+    "The tax collectors of Hell have come knocking. Everyone currently in Hell ({count} participants) "
+    "has been charged **-{penalty}** of personal survival time."
+)
+HELL_EVENT_CULLING_START = (
+    "⚔️ **HELL EVENT — THE CULLING**\n\n"
+    "Hell demands proof of life **right now**.\n"
+    "An immediate roll call has been triggered: reply **Yes** in time or be disconnected from the VC."
+)
+HELL_EVENT_SECRET_TITLE = "🕯️ SECRET HELL EVENT — ???"
+HELL_EVENT_SECRET_FOOTER = "Its nature stays hidden until it ends"
+HELL_EVENT_SECRET_START = (
+    "🕯️ **A SECRET HELL EVENT HAS BEGUN**\n\n"
+    "Something has changed deep within Hell…\n"
+    "What exactly? **Nobody knows — yet.**\n\n"
+    "The veil lifts when the event ends. Stay alert."
+)
+HELL_EVENT_SECRET_END_TITLE = "🕯️ SECRET HELL EVENT REVEALED — {name}"
+HELL_EVENT_SECRET_REVEAL = (
+    "🕯️ **THE SECRET EVENT IS REVEALED: {name}**\n\n"
+    "The veil lifts — all along, it was **{name}**.\n\n"
+    "{description}"
+)
 CMD_HELLEVENTS_TITLE = "⚡ HELL EVENTS"
 CMD_HELLEVENTS_STATUS_NONE = "*No Hell Event is currently active.*"
+CMD_HELLEVENTS_ACTIVE_SECRET = "🔮 ACTIVE: ??? (Secret Event)"
 CMD_HELLEVENTS_TRIGGERED = "⚡ Triggered Hell Event: **{name}**."
+CMD_HELLEVENTS_TRIGGERED_SECRET = (
+    "🕯️ Triggered a **secret** Hell Event — its nature stays hidden until it ends."
+)
+CMD_HELLEVENTS_LOCKED = (
+    "🔒 **{name}** is locked — it unlocks at **Difficulty {level} ({tier})**, "
+    "{hours}h into the run. Current difficulty: **{current_level} ({current_name})**."
+)
 
 # Finale System
 FINALE_FINAL_HOUR_TITLE = "👹 THE FINAL HOUR"
@@ -627,22 +705,39 @@ CMD_GAMBLE_LOCKED = (
 )
 CMD_GAMBLE_NOT_RUNNING = "❌ No event is currently running (status `{status}`)."
 CMD_GAMBLE_PAUSED = "⏸️ Cannot gamble while the event is paused."
+CMD_GAMBLE_GRACE = "⚠️ Cannot gamble while the voice channel is empty — get someone back in first."
+CMD_GAMBLE_NOT_IN_VC = "❌ You must be **in the Hell voice channel** to gamble."
 CMD_GAMBLE_NO_TIME = "❌ You have **{user_time}** recorded time, but you need at least **{min_time}** to place this bet."
 CMD_GAMBLE_INVALID_BET = "❌ Bet amount must be positive and at most **{max_hours}h** for Difficulty {level}."
 CMD_GAMBLE_HOURLY_LIMIT = (
     "❌ **Hourly gambling limit reached.** You can only gamble **{limit} time(s) per hour**. "
     "Next gamble available in **{time_left}**."
 )
+CMD_GAMBLE_OVERFLOW = (
+    "⏳ **Fast bets used** ({limit} this hour). You can still gamble — extra bets use a "
+    "**separate timer**. Wait **{cooldown}**."
+)
 CMD_GAMBLE_COOLDOWN = "⏳ You must wait **{cooldown}** before gambling again."
 CMD_GAMBLE_WIN = (
-    "🎰 **GAMBLE WON!** 🎲 {who} rolled a WIN ({win_chance}% odds) on Difficulty {level}!\n\n"
+    "🎰 **GAMBLE WON!** 🎲 {who} rolled a WIN ({win_chance}% odds on this bet) on Difficulty {level}!\n\n"
     "**+{reward_time}** has been added to your personal leaderboard timer! 🔥\n"
+    "*Bet:* `{bet_time}` · *Net gain:* `+{net_gain}` · *New leaderboard time:* `{new_time}`\n"
+    "*Bigger bets pay the same multiplier but with worse odds.*"
+)
+CMD_GAMBLE_JACKPOT = (
+    "💎 **JACKPOT!** 🎲 {who} hit a **{multiplier}x** jackpot ({win_chance}% win band) on Difficulty {level}!\n\n"
+    "**+{reward_time}** slammed onto your leaderboard timer! 🔥\n"
     "*Bet:* `{bet_time}` · *Net gain:* `+{net_gain}` · *New leaderboard time:* `{new_time}`"
 )
 CMD_GAMBLE_LOSE = (
-    "💀 **GAMBLE LOST!** 🎲 {who} rolled a LOSS on Difficulty {level}!\n\n"
+    "💀 **GAMBLE LOST!** 🎲 {who} rolled a LOSS ({win_chance}% win odds on this bet) on Difficulty {level}!\n\n"
     "You lost **-{penalty_time}** from your leaderboard timer and have been muted for **{mute_duration}** from the server. 🔇\n"
     "*Bet:* `{bet_time}` · *New leaderboard time:* `{new_time}`"
+)
+CMD_GAMBLE_LOSE_WALLET = (
+    "💀 **GAMBLE LOST!** 🎲 {who} rolled a LOSS ({win_chance}% win odds) on Difficulty {level}!\n\n"
+    "You lost **-{penalty_time}** from Gamble Time (heavier than the stake — **no mute**).\n"
+    "*Bet:* `{bet_time}` · *New Gamble Time:* `{new_time}`"
 )
 
 CMD_MYSTATS_NONE = (

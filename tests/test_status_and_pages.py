@@ -206,6 +206,95 @@ def test_push_docs_handles_git_missing(tmp_path):
         assert result is False
 
 
+# ------------------------------------------------- live-server discovery file
+
+
+def test_write_live_server_file(tmp_path, isolate_live_server_file):
+    # The autouse fixture redirects writes away from the repo; it yields the
+    # directory the file is really written to.
+    from hell.pages_sync import write_live_server_file
+
+    path = write_live_server_file(tmp_path, "https://hell.example.com/")
+    assert path == isolate_live_server_file / "docs" / "live-server.json"
+    data = json.loads(path.read_text())
+    assert data["url"] == "https://hell.example.com"  # trailing slash stripped
+    assert data["source"] == "hellbot"
+    assert "updated" in data
+
+
+def test_write_live_server_file_empty_url_writes_nothing(tmp_path, isolate_live_server_file):
+    from hell.pages_sync import write_live_server_file
+
+    assert write_live_server_file(tmp_path, "   ") is None
+    assert not (isolate_live_server_file / "docs" / "live-server.json").exists()
+
+
+def test_pages_sync_pushes_the_live_server_pointer():
+    """The pointer must be committed with the rest of docs/ or GitHub Pages
+    never learns where the real bot is listening."""
+    from hell.pages_sync import _DOCS_PATHS
+
+    assert "docs/live-server.json" in _DOCS_PATHS
+
+
+def test_sync_status_publishes_live_server_pointer(engine, config):
+    bot = MagicMock()
+    monitor = VoiceMonitor(bot, config, engine, MagicMock())
+    monitor.config.web_public_url = "https://hell.example.com"
+    monitor.config.web_port = 8080
+
+    with patch("hell.monitor.get_status_writer"), \
+            patch("hell.monitor.write_live_server_file") as wr, \
+            patch("hell.monitor.spawn"):
+        monitor.sync_status()
+
+    wr.assert_called_once_with(".", "https://hell.example.com")
+
+
+def test_sync_status_skips_pointer_when_no_public_url(engine, config):
+    bot = MagicMock()
+    monitor = VoiceMonitor(bot, config, engine, MagicMock())
+    monitor.config.web_public_url = ""
+
+    with patch("hell.monitor.get_status_writer"), \
+            patch("hell.monitor.write_live_server_file") as wr, \
+            patch("hell.monitor.spawn"):
+        monitor.sync_status()
+
+    wr.assert_not_called()
+
+
+def test_sync_status_skips_pointer_when_web_server_disabled(engine, config):
+    bot = MagicMock()
+    monitor = VoiceMonitor(bot, config, engine, MagicMock())
+    monitor.config.web_public_url = "https://hell.example.com"
+    monitor.config.web_port = 0  # dashboard disabled -> the pointer would lie
+
+    with patch("hell.monitor.get_status_writer"), \
+            patch("hell.monitor.write_live_server_file") as wr, \
+            patch("hell.monitor.spawn"):
+        monitor.sync_status()
+
+    wr.assert_not_called()
+
+
+def test_config_reads_web_public_url(monkeypatch):
+    from hell.config import Config
+
+    env = {
+        "DISCORD_TOKEN": "t",
+        "GUILD_ID": "1",
+        "ANNOUNCE_CHANNEL_ID": "2",
+        "GAMENIGHT_HOST_ROLE_ID": "3",
+        "CLANKER_ROLE_ID": "4",
+        "WEB_PUBLIC_URL": " https://hell.example.com ",
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    cfg = Config.from_env(env_file="/nonexistent/.env")
+    assert cfg.web_public_url == "https://hell.example.com"  # trimmed
+
+
 def test_push_docs_handles_git_commands(tmp_path):
     with patch("shutil.which", return_value="/usr/bin/git"):
         with patch("asyncio.create_subprocess_exec") as mock_exec:
@@ -217,6 +306,71 @@ def test_push_docs_handles_git_commands(tmp_path):
 
             result = asyncio.run(push_docs(tmp_path))
             assert result is False
+
+
+def _make_git_repo(tmp_path):
+    """A real repo with a bare 'remote' and branch tracking configured."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    repo.mkdir()
+
+    def git(*args, cwd=repo):
+        subprocess.run(["git", *args], cwd=cwd, check=True,
+                       capture_output=True)
+
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                   capture_output=True)
+    git("init", "-b", "main")
+    git("config", "user.email", "bot@example.com")
+    git("config", "user.name", "HellBot")
+    git("remote", "add", "origin", str(remote))
+    (repo / "docs").mkdir()
+    (repo / "docs" / "index.html").write_text("<html>hi</html>\n")
+    git("add", "docs/index.html")
+    git("commit", "-m", "initial")
+    git("config", "branch.main.remote", "origin")
+    git("config", "branch.main.merge", "refs/heads/main")
+    return repo
+
+
+def test_push_docs_real_repo_without_live_server_file(tmp_path):
+    """No WEB_PUBLIC_URL -> no live-server.json. The push must still work:
+    staging a missing path used to break the whole Pages sync."""
+    repo = _make_git_repo(tmp_path)
+    (repo / "docs" / "status.json").write_text('{"status": "IDLE"}\n')
+
+    assert asyncio.run(push_docs(repo)) is True
+
+    import subprocess
+    log = subprocess.run(["git", "log", "--oneline"], cwd=repo,
+                         check=True, capture_output=True, text=True).stdout
+    assert "update live status" in log
+    # The commit reached the bare remote.
+    remote_log = subprocess.run(
+        ["git", "--git-dir", str(tmp_path / "remote.git"), "log", "--oneline", "main"],
+        check=True, capture_output=True, text=True).stdout
+    assert "update live status" in remote_log
+
+
+def test_push_docs_real_repo_pushes_live_server_pointer(tmp_path):
+    """When the pointer exists it is committed and pushed with the rest."""
+    repo = _make_git_repo(tmp_path)
+    (repo / "docs" / "status.json").write_text('{"status": "RUNNING"}\n')
+    # Written directly: the autouse fixture redirects the helper off-repo.
+    (repo / "docs" / "live-server.json").write_text(
+        json.dumps({"url": "https://hell.example.com", "updated": "x", "source": "hellbot"}) + "\n"
+    )
+
+    assert asyncio.run(push_docs(repo)) is True
+
+    import subprocess
+    shown = subprocess.run(
+        ["git", "show", "--stat", "HEAD"], cwd=repo,
+        check=True, capture_output=True, text=True).stdout
+    assert "docs/live-server.json" in shown
+    assert "docs/status.json" in shown
 
 
 def test_html_files_structure():
@@ -253,7 +407,331 @@ def test_html_files_structure():
     assert "evVc" in dev_content
     assert "renderFromStatusJson" in dev_content
 
+    # Both pages must carry the live-bot connection layer: they discover the
+    # real bot (live-server.json / saved server / same origin), probe
+    # /health, connect via WebSocket with an HTTP polling fallback, and offer
+    # the manual 🔌 override.
+    for content in (index_content, dev_content):
+        assert "connectFlow" in content
+        assert "connSettingsBtn" in content
+        assert "live-server.json" in content
+        assert "/health" in content or "healthUrlFor" in content
+        assert "hellbot.liveServer" in content  # localStorage override key
+
     # Verify status.json parses as valid JSON
     status_data = json.loads(status_json.read_text())
     assert "event_status" in status_data
     assert "last_updated" in status_data
+
+
+# ------------------------------------------------- live web server behaviour
+
+
+@pytest.fixture
+def web_app():
+    """A fresh web app with clean module state (no leftover provider/snapshot)."""
+    from hell import web as hellweb
+
+    hellweb.set_status_provider(None)
+    hellweb._last_snapshot = None
+    hellweb._snapshot_ts = 0.0
+    hellweb.create_app()  # ensure the app builds with clean state
+    yield hellweb
+    hellweb.set_status_provider(None)
+    hellweb._last_snapshot = None
+    hellweb._snapshot_ts = 0.0
+
+
+def test_status_json_serves_live_data_when_provider_registered(web_app):
+    """With the bot running, /status.json must be fresh — not the static file
+    (which is only rewritten on the 15-minute heartbeat)."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            # No provider: falls back to the static file (GitHub Pages mode).
+            async with client.get("/status.json") as r:
+                assert r.status == 200
+                assert r.headers.get("Cache-Control") == "no-store"
+                static_data = await r.json()
+
+            # Register a live provider (what the bot does at startup).
+            calls = {"n": 0}
+
+            def provider():
+                calls["n"] += 1
+                return {"event_status": "RUNNING", "elapsed_seconds": 42.0, "bot_connected": True}
+
+            web_app.set_status_provider(provider)
+            async with client.get("/status.json") as r:
+                live = await r.json()
+            assert live["event_status"] == "RUNNING"
+            assert live["elapsed_seconds"] == 42.0
+            assert calls["n"] == 1
+            assert static_data != live  # genuinely different data sources
+
+            # A failing provider never breaks the endpoint.
+            def boom():
+                raise RuntimeError("no engine today")
+
+            web_app.set_status_provider(boom)
+            async with client.get("/status.json") as r:
+                assert r.status == 200
+                fallback = await r.json()
+            assert fallback == static_data
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_cors_headers_let_other_origins_read_live_data(web_app):
+    """The GitHub Pages site is a different origin than the bot's server.
+    Without CORS headers the browser would refuse to fetch the bot's live
+    ``/status.json`` / ``/health`` — so every response carries them."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            async with client.get("/status.json") as r:
+                assert r.status == 200
+                assert r.headers["Access-Control-Allow-Origin"] == "*"
+            async with client.get("/health") as r:
+                assert r.status == 200
+                assert r.headers["Access-Control-Allow-Origin"] == "*"
+            async with client.get("/") as r:
+                assert r.status == 200
+                assert r.headers["Access-Control-Allow-Origin"] == "*"
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_options_preflight_answered_with_cors(web_app):
+    """Cross-origin browsers send an OPTIONS preflight first; the server must
+    answer it (204 + CORS headers) without touching the real handler."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            for route in ("/status.json", "/health", "/ws", "/"):
+                async with client.options(route) as r:
+                    assert r.status == 204, route
+                    assert r.headers["Access-Control-Allow-Origin"] == "*", route
+                    assert "GET" in r.headers["Access-Control-Allow-Methods"], route
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_cors_middleware_does_not_break_websocket(web_app):
+    """The WS upgrade response must pass through the middleware untouched."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            await web_app.broadcast({"type": "snapshot", "status": "IDLE"})
+            # Cross-origin handshake: browsers send an Origin header and the
+            # server must accept it (GitHub Pages -> bot's machine).
+            ws = await client.ws_connect("/ws", origin="https://jaime-gaming.github.io")
+            msg = await asyncio.wait_for(ws.receive(), 1.0)
+            assert json.loads(msg.data)["type"] == "snapshot"
+            await ws.close()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_websocket_client_receives_last_snapshot_on_connect(web_app):
+    """A newly connected browser renders instantly instead of waiting <=5s."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            # Nothing pushed yet -> no initial message.
+            ws = await client.ws_connect("/ws")
+            try:
+                await asyncio.wait_for(ws.receive(), timeout=0.2)
+                raise AssertionError("should not have received anything yet")
+            except asyncio.TimeoutError:
+                pass
+            await ws.close()
+
+            # After a broadcast, the NEXT client gets it immediately.
+            await web_app.broadcast({"type": "snapshot", "status": "RUNNING", "elapsed": 7})
+            ws2 = await client.ws_connect("/ws")
+            msg = await asyncio.wait_for(ws2.receive(), timeout=1.0)
+            data = json.loads(msg.data)
+            assert data == {"type": "snapshot", "status": "RUNNING", "elapsed": 7}
+            await ws2.close()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_broadcast_remembers_snapshot_without_clients(web_app):
+    """The payload is stored even with zero clients (fresh /status.json, new
+    connections) — broadcast() must not skip it."""
+
+    async def run():
+        assert web_app.client_count() == 0
+        await web_app.broadcast({"type": "snapshot", "status": "IDLE"})
+        assert web_app._last_snapshot == {"type": "snapshot", "status": "IDLE"}
+
+    asyncio.run(run())
+
+
+def test_health_reports_live_status_and_snapshot_age(web_app):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run():
+        client = TestClient(TestServer(web_app.create_app()))
+        await client.start_server()
+        try:
+            async with client.get("/health") as r:
+                data = await r.json()
+            assert data["ok"] is True
+            assert data["live_status"] is False
+            assert data["snapshot_age_seconds"] is None
+
+            web_app.set_status_provider(lambda: {"event_status": "IDLE"})
+            await web_app.broadcast({"type": "snapshot"})
+            async with client.get("/health") as r:
+                data = await r.json()
+            assert data["live_status"] is True
+            assert data["snapshot_age_seconds"] is not None
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_build_payload_matches_written_file(tmp_path, engine, config, monitor):
+    """The build_payload refactor must keep write()'s output identical."""
+    from hell.status_writer import get_status
+
+    start_ts = 1_700_000_000.0
+    engine.start(
+        now=start_ts, guild_id=1, voice_channel_id=config.voice_channel_id,
+        announce_channel_id=2, started_by=99,
+        initial_participants=[ParticipantRef(1, "Alice")],
+    )
+    path = tmp_path / "status.json"
+    get_status().write(path, engine=engine, monitor=monitor, stream=None, bot=None)
+    written = json.loads(path.read_text())
+
+    payload = get_status().build_payload(engine=engine, monitor=monitor, stream=None, bot=None)
+    # Same keys and same status (timestamps naturally differ between calls).
+    assert set(written) == set(payload)
+    assert written["event_status"] == payload["event_status"] == "RUNNING"
+    assert written["leaderboard_total"] == payload["leaderboard_total"] == 1
+    assert written["voice_channel_id"] == payload["voice_channel_id"] == config.voice_channel_id
+
+
+def test_websocket_payload_matches_what_the_pages_render(config):
+    """The WS payload must keep the exact shape the browser JS renders.
+
+    ``docs/index.html`` only renders WS messages whose ``type`` is
+    ``"snapshot"`` and reads a fixed set of keys; ``renderFromStatusJson``
+    (the polling fallback) reads the status.json keys.  This pins both
+    contracts so neither side can drift silently.
+    """
+    import asyncio
+
+    from hell import web as hellweb
+    from hell.bot import build_bot
+    from tests.conftest import T0, obs, start
+    from tests.test_integration import FakeTextChannel
+    from tests.test_monitor import FakeMember, FakeVoiceChannel
+
+    class _ChanBot:
+        def get_channel(self, cid):
+            return voice if cid == voice.id else text
+
+    text = FakeTextChannel(config.announce_channel_id)
+    voice = FakeVoiceChannel([FakeMember(1, "Alice"), FakeMember(2, "Bob")])
+    bot = build_bot(config)
+    try:
+        bot.get_channel = _ChanBot().get_channel  # type: ignore[method-assign]
+        engine = bot.engine
+        start(engine, T0, 1, 2)
+        for i in range(1, 61):
+            engine.tick(obs(T0 + i, 1, 2))
+
+        asyncio.run(bot._push_web_snapshot())
+        payload = hellweb._last_snapshot
+        assert payload is not None
+
+        # The gate in the pages' onmessage
+        assert payload["type"] == "snapshot"
+        # Keys the pages' render() dereferences directly
+        for key in (
+            "ts", "status", "elapsed", "total", "remaining", "fraction",
+            "participants", "paused", "pause_reason", "end_reason", "start_ts",
+            "end_ts", "estimated_end_ts", "grace_open", "grace_seconds_left",
+            "grace_total", "current_milestone", "upcoming_milestone",
+            "milestones", "leaderboard", "leaderboard_total", "alive_check",
+            "continuation", "difficulty_level", "difficulty_name",
+            "health_errors", "health_warnings", "health_info", "log_tail",
+            "rate_limits_5min", "blind_seconds", "active_tasks",
+            "operator_dm_ok", "version",
+        ):
+            assert key in payload, f"the web pages read {key!r} — missing from the WS payload"
+        assert payload["status"] == "RUNNING"
+        assert payload["participants"] == 2
+        assert payload["leaderboard"] and payload["leaderboard"][0]["time"]
+        assert all(m["hours"] and "title" in m for m in payload["milestones"])
+    finally:
+        bot.store.close()
+        hellweb._last_snapshot = None
+        hellweb._snapshot_ts = 0.0
+
+
+def test_status_json_payload_matches_what_the_pages_normalize(config):
+    """The polling fallback reads these keys via renderFromStatusJson()."""
+    from hell.status_writer import get_status
+    from tests.conftest import T0, obs, start
+    from tests.test_integration import FakeTextChannel
+    from tests.test_monitor import FakeMember, FakeVoiceChannel
+
+    class _ChanBot:
+        def get_channel(self, cid):
+            return voice if cid == voice.id else text
+
+    text = FakeTextChannel(config.announce_channel_id)
+    voice = FakeVoiceChannel([FakeMember(1, "Alice")])
+    from hell.bot import build_bot
+    bot = build_bot(config)
+    try:
+        bot.get_channel = _ChanBot().get_channel  # type: ignore[method-assign]
+        engine = bot.engine
+        start(engine, T0, 1)
+        for i in range(1, 30):
+            engine.tick(obs(T0 + i, 1))
+
+        payload = get_status().build_payload(
+            engine=engine, monitor=bot.monitor, stream=None, bot=bot
+        )
+        for key in (
+            "elapsed_seconds", "total_seconds", "remaining_seconds", "fraction",
+            "status", "event_status", "participants", "leaderboard",
+            "alive_check", "grace_open", "milestones",
+        ):
+            assert key in payload, f"renderFromStatusJson reads {key!r} — missing from status.json"
+        assert payload["status"] == "RUNNING"
+    finally:
+        bot.store.close()

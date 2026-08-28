@@ -37,7 +37,7 @@ from .tasks import spawn as _spawn
 from .texts import TEXT
 from .texts import source as texts_source
 from .timeutil import format_hm, format_hms, now_ts
-from .web import broadcast, start_server, stop_server
+from .web import broadcast, set_status_provider, start_server, stop_server
 
 log = logging.getLogger("hell")
 
@@ -78,6 +78,9 @@ class HellBot(commands.Bot):
         self._status_task: Optional[asyncio.Task] = None
         self._web_runner: Optional[aiohttp.web.AppRunner] = None
         self._web_push_task: Optional[asyncio.Task] = None
+        # Serve the bot's LIVE state on /status.json instead of the static
+        # file (which is only rewritten on the 15-minute heartbeat).
+        set_status_provider(self._live_status_payload)
 
     async def setup_hook(self) -> None:
         await self.add_cog(HellCommands(self, self.config, self.engine, self.monitor))
@@ -90,6 +93,15 @@ class HellBot(commands.Bot):
             log.info("Synced %d slash command(s) to guild %s", len(synced), self.config.guild_id)
         except discord.HTTPException as exc:
             log.error("Could not sync slash commands: %s", exc)
+        # DM-only commands (/hell restart, /hell alivecheck) are *global*
+        # commands — without syncing the global set they would never show up
+        # in DMs at all. Global sync is slow to propagate (up to an hour), so
+        # guild copies above keep the server responsive in the meantime.
+        try:
+            await self.tree.sync()
+            log.info("Synced global (DM-only) slash commands")
+        except discord.HTTPException as exc:
+            log.error("Could not sync global slash commands: %s", exc)
 
     async def on_ready(self) -> None:
         log.info("Welcome to Hell v%s — logged in as %s (%s)", __version__, self.user,
@@ -232,12 +244,26 @@ class HellBot(commands.Bot):
                 log.debug("Web push failed", exc_info=True)
             await asyncio.sleep(5)
 
-    async def _push_web_snapshot(self) -> None:
-        """Build and broadcast the current state to every browser tab."""
-        from .web import client_count
-        if client_count() == 0:
-            return
+    def _live_status_payload(self) -> dict:
+        """A fresh status.json-shaped payload, built from the live engine.
 
+        Registered with the web server so ``/status.json`` always reflects the
+        bot's *current* state — even before the first WebSocket push or when a
+        browser can only poll (e.g. a proxy that does not forward WebSockets).
+        """
+        from .status_writer import get_status
+
+        return get_status().build_payload(
+            engine=self.engine, monitor=self.monitor, stream=self.log_stream, bot=self
+        )
+
+    async def _push_web_snapshot(self) -> None:
+        """Build and broadcast the current state to every browser tab.
+
+        Always built (even with zero connected clients): broadcast() remembers
+        the latest snapshot so a client that connects a second later gets it
+        instantly instead of staring at an empty page.
+        """
         now = now_ts()
         snap = self.engine.snapshot(now=now)
         board = self.engine.leaderboard()
@@ -391,7 +417,14 @@ class HellBot(commands.Bot):
             await self.monitor.kick_clankers([member])
 
     async def on_message(self, message: discord.Message) -> None:
-        """Handle alive-check answers in guild channels and ! prefix commands strictly in DMs."""
+        """Handle alive-check answers in guild channels and `!` prefix commands everywhere.
+
+        Prefix commands used to be processed in DMs only, which made `!status`,
+        `!help`, … silently do nothing when typed in the server — the one place
+        people actually tried them.  They now run in server channels too; the
+        alive-check replies ("Yes") never start with the prefix, so the two
+        responsibilities never collide.
+        """
         if message.author.bot:
             return
         if message.guild is not None:
@@ -399,13 +432,9 @@ class HellBot(commands.Bot):
                 await self.monitor.handle_message(message)
             except Exception:  # pragma: no cover - never break on a chat message
                 log.exception("Failed to handle a message for the alive check")
-            return
-        # Direct Messages (DMs) only: process ! prefix commands
         await self.process_commands(message)
 
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
-        if ctx.guild is not None:
-            return
         if isinstance(error, commands.CommandNotFound):
             await ctx.send("Unknown command. Type `!help` or `!status` for a list of available commands.")
             return
